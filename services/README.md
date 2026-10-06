@@ -1,0 +1,1 @@
+Put locally controlled Compose definitions in this directory and reference them from `config/services.json`. The worker requires published images, explicit service healthchecks, and named volumes. It rejects privileged containers, host namespaces, added capabilities, devices, build contexts, and bind mounts.

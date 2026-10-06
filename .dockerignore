@@ -1,0 +1,10 @@
+.git
+.env
+node_modules
+dist
+data
+logs
+notes.txt
+config/services.json
+services/*
+!services/README.md

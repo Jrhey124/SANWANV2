@@ -1,0 +1,30 @@
+services:
+  sanwan:
+    build:
+      context: .
+      target: bot
+    image: sanwan:local
+    container_name: sanwan
+    restart: unless-stopped
+    env_file:
+      - ${SANWAN_ENV_FILE:-.env}
+    environment:
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+      SERVICES_CONFIG: /config/services.json
+      WORKER_URL: ${WORKER_URL:-http://worker:8877}
+    volumes:
+      - sanwan-data:/app/data
+      - sanwan-logs:/app/logs
+      - ./config:/config:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    init: true
+
+volumes:
+  sanwan-data:
+  sanwan-logs:

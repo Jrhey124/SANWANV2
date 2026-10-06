@@ -1,0 +1,30 @@
+{
+  "name": "sanwan",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted Discord CI/CD assistant",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "setup": "node setup.js",
+    "uninstall": "node uninstall.js",
+    "test": "npm run build && node test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3-multiple-ciphers": "^12.4.1",
+    "discord.js": "^14.21.0",
+    "dotenv": "^16.6.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.30",
+    "typescript": "^5.8.3"
+  },
+  "allowScripts": {
+    "better-sqlite3-multiple-ciphers@12.11.1": true
+  }
+}

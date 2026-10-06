@@ -1,0 +1,18 @@
+services:
+  app:
+    image: ghcr.io/owner/app:latest
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8080:8080"
+    volumes:
+      - app-data:/var/lib/app
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  app-data:

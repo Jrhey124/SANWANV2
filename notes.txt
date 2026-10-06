@@ -1,0 +1,96 @@
+/cmd - command
+
+/help  - get cmd manual
+/ping  - check connection
+
+/task - 
+    : tid is case-insensitive and starts on t0
+    : if a task channel exist always trigger (create, update, remove, and near deadline task) notification.
+    : 
+
+    create <task> <assignee> <deadline>
+        → Create a new task with assignment + deadline (coding or non‑coding).
+    update <task | tid> <fields> <value>
+        → Update status, deadline, assignee, or description.
+        Example: /task update status:in-progress
+                 /task update description:"Hardware assembly" deadline:2026-08-30
+    describe <task | tid> <description>
+        → Add or refine the task’s detailed description.
+        Example: /task describe "Write documentation" "Draft API reference section"
+    list <optional scope=<default: all, (all, ...)>>
+        → Show all tasks with assignee, deadline, status. on table format, with description show till n-character(example. 50 char max)
+    remove <task | tid>
+        → Delete a task.
+    bump <task | tid>
+        → Manually trigger a Discord notification.
+
+
+/schedule - Automation
+    : sid is case insensitive, starting on s0
+    : when set called but schedule are already set, update or overwrite
+    set <name | sid> 
+        ontrigger <trigger> <do> - do the job when trigger is get
+        ontime <every> <do> - do the job when trigger is get
+    unset <name | sid> - unset or remove the schedule
+    lists // list schedule
+    history
+
+/logs <name> <lines, def=n>
+/errors <name> <lines, def=n>
+/logs list
+
+/ask <question>
+/ask model list → show available models.
+/ask config → show current provider + model.
+/ask switch <model> → change model (admin only).
+
+/note
+    : nid is case insensitive, starting on n0
+    add <title> <description>
+    lists <optional scope=<default: all, (all, ...)>>
+    search <keyword | nid>
+    remove <title | nid>
+    push <sentence>
+    push '<sentence>\n<sentence>'
+    pop
+    export <title> - export titled note
+    exportall - export all notes
+
+/deploy
+    start <service>
+    stop <service>
+    restart <service>
+    status <service>
+    rollback <commit | version>
+    simulate
+    production=<branch>
+    staging=<branch>
+
+
+/status
+    disks
+    resources
+    network
+
+requirements:
+    test.js -- test the functionality
+    setup.js -- build the .env
+        must be allowed to be stored as scedule/daemon service
+    uninstall.js -- as easy as the setup.js
+    .env -- where the credentials are stored
+        SQLITE_KEY
+        ...
+
+    : requirement is being lightweight, and easy to setup/use. 
+    : discord error must be notified on error channel if applicable.
+    : setup.js must determine what are the command it can run
+    : upon setup user must define the computer architecture/os so sanwan is compatible (arm, windows, linux, etc) choices must be defined 
+    : sanwan logs its own logs
+    : all information must be stored inside a sqlite file and the key is stored inside the .env
+    : upon choosing the architecture/os it must be able determine the disk, resources, etc. and also how to manage services. 
+    : make it also easily to setup to github webhook, can connect even without a public endpoint.
+    : another priority is its security, dont make it a vector for priviledge escalation.
+    : 3 channle optional: error, task, github update.
+    : /schedule commaand should be able to perform github integration. for example trigger upon webhook is fetch.
+    : make sanwan very flexible upon ci/cd deployment.
+    : this project is designed for self hosted deployment.

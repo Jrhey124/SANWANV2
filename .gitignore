@@ -1,0 +1,9 @@
+.env
+data/
+logs/
+config/services.json
+services/*
+!services/README.md
+node_modules/
+dist/
+*.log

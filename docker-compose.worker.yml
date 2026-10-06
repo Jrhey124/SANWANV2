@@ -1,0 +1,53 @@
+services:
+  sanwan:
+    environment:
+      SERVICES_CONFIG: /config/services.json
+      WORKER_URL: http://worker:8877
+      WORKER_TOKEN: ${WORKER_TOKEN:?Run node setup.js to generate WORKER_TOKEN}
+    networks:
+      - default
+      - worker-api
+
+  worker:
+    build:
+      context: .
+      target: worker
+    image: sanwan-worker:local
+    restart: unless-stopped
+    profiles: [deployment]
+    environment:
+      SERVICES_CONFIG: /config/services.json
+      SERVICES_ROOT: /services
+      WORKER_STATE_DIR: /worker-state
+      WORKER_TMP_DIR: /tmp
+      WORKER_TOKEN: ${WORKER_TOKEN:?Run node setup.js to generate WORKER_TOKEN}
+      GHCR_USERNAME: ${GHCR_USERNAME:-}
+      GHCR_TOKEN: ${GHCR_TOKEN:-}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+      - ./config:/config:ro
+      - ./services:/services:ro
+      - sanwan-worker-state:/worker-state
+    networks: [worker-api]
+    group_add:
+      - "${DOCKER_SOCKET_GID:-1000}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8877/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  worker-api:
+    internal: true
+
+volumes:
+  sanwan-worker-state:

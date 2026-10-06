@@ -1,0 +1,25 @@
+{
+  "services": {
+    "example-app": {
+      "github_repository": "owner/repository",
+      "workflow_name": "Build and publish image",
+      "staging_branch": "develop",
+      "production_branch": "main",
+      "image_repository": "ghcr.io/owner/example-app",
+      "environments": {
+        "staging": {
+          "compose_project": "example-staging",
+          "compose_file": "example-app/compose.staging.yml",
+          "compose_service": "app",
+          "health_timeout_seconds": 120
+        },
+        "production": {
+          "compose_project": "example-production",
+          "compose_file": "example-app/compose.production.yml",
+          "compose_service": "app",
+          "health_timeout_seconds": 180
+        }
+      }
+    }
+  }
+}

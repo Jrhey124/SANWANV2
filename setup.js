@@ -5,155 +5,213 @@ const readline = require('node:readline/promises');
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
 const { findDockerCommand } = require('./docker-cli.js');
+const { runSavedChecks } = require('./setup-checks.js');
 
-function readSecret(prompt) {
+function readSecret(label) {
   return new Promise((resolve, reject) => {
     if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== 'function') {
       reject(new Error('Run setup in an interactive terminal so credentials can be entered without echo.'));
       return;
     }
-    process.stdout.write(prompt);
+    process.stdout.write(label);
     process.stdin.setRawMode(true);
     process.stdin.resume();
+    process.stdin.resume();
     let value = '';
+    const cleanup = () => { process.stdin.off('data', onData); process.stdin.setRawMode(false); };
     const onData = chunk => {
       for (const char of chunk.toString('utf8')) {
-        if (char === '\u0003') { cleanup(); reject(new Error('Setup cancelled.')); return; }
+        if (char === '\u0003') { cleanup(); process.stdout.write('\n'); reject(new Error('Setup cancelled.')); return; }
         if (char === '\r' || char === '\n') { cleanup(); process.stdout.write('\n'); resolve(value); return; }
-        if (char === '\u007f' || char === '\b') value = value.slice(0,-1);
+        if (char === '\u007f' || char === '\b') value = value.slice(0, -1);
         else if (char >= ' ') value += char;
       }
     };
-    const cleanup = () => { process.stdin.off('data', onData); process.stdin.setRawMode(false); };
     process.stdin.on('data', onData);
   });
 }
 
-function isDiscordId(value) {
-  return /^\d{17,20}$/.test(value.trim());
+function isDiscordId(value) { return /^\d{17,20}$/.test(value.trim()); }
+function parseChoice(value, allowed, fallback) {
+  const selected = value.trim() || fallback;
+  return allowed.includes(selected) ? selected : undefined;
+}
+function discordFieldError(key, value) {
+  if (!value.trim()) return 'This value is required.';
+  if (key !== 'DISCORD_TOKEN' && !isDiscordId(value)) return 'Enter a numeric Discord ID of 17 to 20 digits.';
+  return undefined;
+}
+async function prompt(label) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try { return await rl.question(label); } finally { rl.close(); }
+}
+async function choice(label, allowed, fallback) {
+  while (true) {
+    const selected = parseChoice(await prompt(label), allowed, fallback);
+    if (selected) return selected;
+    console.log(`  Choose ${allowed.join(', ')}.`);
+  }
+}
+async function required(key, label, existing, secret = false) {
+  if (existing[key]?.trim()) { console.log(`  ${label}: already configured`); return existing[key]; }
+  while (true) {
+    const value = secret ? await readSecret(`  ${label} (hidden): `) : await prompt(`  ${label}: `);
+    const error = discordFieldError(key, value);
+    if (!error) return value.trim();
+    console.log(`  ${error}${key === 'DISCORD_GUILD_ID' ? ' Enable Developer Mode in Discord to copy your server ID.' : ''}`);
+  }
+}
+async function optional(key, label, values, secret = false, io = {}) {
+  const askChoice = io.choice || choice;
+  const ask = io.prompt || prompt;
+  const askSecret = io.readSecret || readSecret;
+  const existing = values[key]?.trim();
+  if (existing) {
+    console.log(`  ${label}: already configured`);
+    if (await askChoice('  1) Keep existing  2) Replace [1]: ', ['1', '2'], '1') === '1') return;
+  }
+  const name = `${existing ? 'New ' : ''}${label}`;
+  const hint = existing ? 'keep existing' : 'skip';
+  const value = (secret ? await askSecret(`  ${name} (hidden, Enter to ${hint}): `) : await ask(`  ${name} (Enter to ${hint}): `)).trim();
+  if (value) values[key] = value;
 }
 
-function validateComposeConfig(dockerCommand,composeBase,env,{cwd=process.cwd(),run=spawnSync}={}){
-  const envFile=`.env.sanwan-setup-${crypto.randomBytes(8).toString('hex')}`;
-  const envPath=path.join(cwd,envFile);
-  try{
-    fs.writeFileSync(envPath,env,{mode:0o600,flag:'wx'});
-    if(process.platform!=='win32') fs.chmodSync(envPath,0o600);
-    const result=run(dockerCommand,[...composeBase,'--env-file',envFile,'config','--quiet'],{
-      cwd,encoding:'utf8',windowsHide:true,env:{...process.env,SANWAN_ENV_FILE:envFile}
+function validateComposeConfig(dockerCommand, composeBase, env, { cwd = process.cwd(), run = spawnSync } = {}) {
+  const envFile = `.env.sanwan-setup-${crypto.randomBytes(8).toString('hex')}`;
+  const envPath = path.join(cwd, envFile);
+  try {
+    fs.writeFileSync(envPath, env, { mode: 0o600, flag: 'wx' });
+    if (process.platform !== 'win32') fs.chmodSync(envPath, 0o600);
+    const result = run(dockerCommand, [...composeBase, '--env-file', envFile, 'config', '--quiet'], {
+      cwd, encoding: 'utf8', windowsHide: true, env: { ...process.env, SANWAN_ENV_FILE: envFile }
     });
-    if(result.error) throw result.error;
-    if(result.status!==0) throw new Error('Docker Compose configuration validation failed; the existing .env was left unchanged.');
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error('Docker Compose configuration validation failed; the existing .env was left unchanged.');
     return true;
-  }finally{if(fs.existsSync(envPath))fs.rmSync(envPath);}
+  } finally { if (fs.existsSync(envPath)) fs.rmSync(envPath); }
 }
 
 async function main() {
-  const platform = `${os.platform()} ${os.arch()}`;
-  console.log(`SANWAN setup · detected ${platform}`);
-  const profiles = ['Linux x64','Linux ARM64','Windows Docker Desktop x64','Windows Docker Desktop ARM64'];
-  console.log(`Supported target profiles: ${profiles.map((p,i)=>`${i+1}) ${p}`).join(' · ')}`);
-  if (!['linux', 'win32'].includes(os.platform()) || !['x64', 'arm64'].includes(os.arch())) throw new Error('Supported setup targets are Linux x64/ARM64 and Windows x64/ARM64 with Docker Desktop Linux containers.');
-  const target = os.platform()==='win32'
-    ?`Windows Docker Desktop ${os.arch()==='arm64'?'ARM64':'x64'}`
-    :`Linux ${os.arch()==='arm64'?'ARM64':'x64'}`;
-  const selectRl=readline.createInterface({input:process.stdin,output:process.stdout});
-  try {
-    const selected=await selectRl.question(`Select the profile for this host [${target}]: `);
-    if(selected.trim() && profiles[Number(selected.trim())-1]!==target) throw new Error(`This setup process is running on ${target}; run it on the selected host profile.`);
-  } finally {selectRl.close();}
-  console.log(`Target profile: ${target}`);
-  const dockerCommand=findDockerCommand();
-  let dockerEngineAvailable=false;
-  let dockerComposeAvailable=false;
-  for (const [label, args] of [['Docker Engine', ['version','--format','{{.Server.Version}}']], ['Docker Compose v2', ['compose','version','--short']]]) {
-    const capability = spawnSync(dockerCommand, args, { encoding: 'utf8', windowsHide: true });
-    if(label==='Docker Engine') dockerEngineAvailable=capability.status===0;
-    if(label==='Docker Compose v2') dockerComposeAvailable=capability.status===0;
-    console.log(`${label}: ${capability.status === 0 ? 'available' : 'not detected (CI and status commands remain available; local deployment is disabled)'}`);
+  if (!['linux', 'win32'].includes(os.platform()) || !['x64', 'arm64'].includes(os.arch())) {
+    throw new Error('Supported setup targets are Linux x64/ARM64 and Windows x64/ARM64 with Docker Desktop Linux containers.');
   }
-  const dockerSecurity=dockerEngineAvailable?spawnSync(dockerCommand,['info','--format','{{json .SecurityOptions}}'],{encoding:'utf8',windowsHide:true}):undefined;
-  let rootlessDockerAvailable=false;
-  if(dockerSecurity?.status===0){try{rootlessDockerAvailable=(JSON.parse(dockerSecurity.stdout)||[]).some(value=>/rootless/i.test(String(value)));}catch{}}
-  console.log(`Rootless Docker (deployment worker): ${rootlessDockerAvailable?'available':'not detected; worker deployments will remain disabled'}`);
-  const composeBase=['compose','-f','docker-compose.yml'];
-  let rl;
-  try {
-    let existing = {};
-    if (fs.existsSync('.env')) {
-      rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const answer = await rl.question('Existing .env found. Preserve its values and fill missing keys? [Y/n] ');
-      if (!/^y(es)?$/i.test(answer || 'y')) throw new Error('Setup cancelled; existing configuration was left unchanged.');
-      for (const line of fs.readFileSync('.env', 'utf8').split(/\r?\n/)) { const i=line.indexOf('='); if(i>0) existing[line.slice(0,i)]=line.slice(i+1); }
-      rl.close();
-      rl = undefined;
+  const target = os.platform() === 'win32' ? `Windows Docker Desktop ${os.arch()}` : `Linux ${os.arch()}`;
+  console.log('\nSANWAN setup');
+  console.log(`Detected host: ${target}`);
+  console.log('Four steps: Discord, optional features, Docker check, and launch.');
+  const existing = {};
+  if (fs.existsSync('.env')) {
+    console.log('\nExisting .env found. Optional settings can be kept or replaced.');
+    const mode = await choice('  1) Configure  2) Check saved setup  3) Cancel [1]: ', ['1', '2', '3'], '1');
+    if (mode === '3') return;
+    if (mode === '2') { await runSavedChecks(); return; }
+    for (const line of fs.readFileSync('.env', 'utf8').split(/\r?\n/)) {
+      const i = line.indexOf('=');
+      if (i > 0) existing[line.slice(0, i)] = line.slice(i + 1);
     }
-    const discordToken = existing.DISCORD_TOKEN || await readSecret('Discord bot token (input hidden): ');
-    const githubToken = existing.GITHUB_TOKEN || await readSecret('GitHub token, press Enter to skip (input hidden): ');
-    const ghcrToken = existing.GHCR_TOKEN || await readSecret('Optional GHCR read token, press Enter to skip (input hidden): ');
-    const askApiKey = existing.ASK_API_KEY || await readSecret('Optional AI provider API key, press Enter to skip (input hidden): ');
-    rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const ask = async (key, prompt, optional=false) => existing[key] || await rl.question(`${prompt}${optional?' (optional)':''}: `);
-    const defaultDockerSocket=process.env.DOCKER_HOST?.replace(/^unix:\/\//,'')||(os.platform()==='win32'?'':`${process.env.XDG_RUNTIME_DIR||`/run/user/${process.getuid?.()??1000}`}/docker.sock`);
-    const dockerSocketPath=await ask('DOCKER_SOCKET_PATH',`Rootless Docker socket path [${defaultDockerSocket}]`,true);
-    const socketPath=dockerSocketPath.trim()||defaultDockerSocket;
-    let defaultSocketGid='1000';
-    try { defaultSocketGid=String(fs.statSync(socketPath).gid); } catch {}
-    const values = {
-      DISCORD_TOKEN: discordToken,
-      DISCORD_APPLICATION_ID: await ask('DISCORD_APPLICATION_ID','Discord application ID'),
-      DISCORD_GUILD_ID: await ask('DISCORD_GUILD_ID','Discord server ID'),
-      AUTHORIZED_ROLE_IDS: await ask('AUTHORIZED_ROLE_IDS','Roles allowed to inspect CI and deployment (comma-separated role IDs)',true),
-      GITHUB_TOKEN: githubToken,
-      GHCR_USERNAME: await ask('GHCR_USERNAME','GitHub username for private GHCR images',true),
-      GHCR_TOKEN: ghcrToken,
-      ASK_PROVIDER: await ask('ASK_PROVIDER','Optional AI provider (ollama or openai-compatible)',true),
-      ASK_BASE_URL: await ask('ASK_BASE_URL','Optional AI API base URL',true),
-      ASK_MODEL: await ask('ASK_MODEL','Optional initial AI model ID',true),
-      ASK_API_KEY: askApiKey,
-      GITHUB_REPOSITORIES: await ask('GITHUB_REPOSITORIES','Allowed repositories (comma-separated owner/repo)',true),
-      GITHUB_CHANNEL_ID: await ask('GITHUB_CHANNEL_ID','Optional GitHub update channel ID',true),
-      TASK_CHANNEL_ID: await ask('TASK_CHANNEL_ID','Optional task notification channel ID',true),
-      ERROR_CHANNEL_ID: await ask('ERROR_CHANNEL_ID','Optional error channel ID',true),
-      APPROVAL_CHANNEL_ID: await ask('APPROVAL_CHANNEL_ID','Optional production approval channel ID (blank uses request channel)',true),
-      SQLITE_KEY: existing.SQLITE_KEY || crypto.randomBytes(32).toString('hex'),
-      WORKER_TOKEN: existing.WORKER_TOKEN || crypto.randomBytes(32).toString('hex'),
-      DOCKER_SOCKET_PATH: socketPath,
-      DOCKER_SOCKET_GID: await ask('DOCKER_SOCKET_GID',`Rootless Docker socket group ID [${defaultSocketGid}]`,true)||defaultSocketGid
-    };
-    for (const name of ['DISCORD_TOKEN','DISCORD_APPLICATION_ID','DISCORD_GUILD_ID']) {
-      if (!values[name]?.trim()) throw new Error(`${name} is required; configuration was not written.`);
+  }
+  const values = { ...existing };
+  console.log('\n[1/4] Connect Discord');
+  console.log('  Create an app at discord.com/developers/applications and open its Bot page.');
+  console.log('  Invite it with the bot and applications.commands scopes.');
+  values.DISCORD_TOKEN = await required('DISCORD_TOKEN', 'Bot token', existing, true);
+  console.log('  Copy Application ID from the app General Information page.');
+  values.DISCORD_APPLICATION_ID = await required('DISCORD_APPLICATION_ID', 'Application ID', existing);
+  console.log('  Enable Developer Mode in Discord, right-click the server, and copy its ID.');
+  values.DISCORD_GUILD_ID = await required('DISCORD_GUILD_ID', 'Server ID', existing);
+
+  console.log('\n[2/4] Optional features');
+  console.log('  Configure features now or rerun setup later.');
+  while (true) {
+    console.log('  1) Continue  2) GitHub monitoring  3) AI chat  4) Advanced settings');
+    const selected = await choice('  Choice [1]: ', ['1', '2', '3', '4'], '1');
+    if (selected === '1') break;
+    if (selected === '2') {
+      console.log('  GitHub monitoring needs a token and an owner/repo allowlist.');
+      console.log('  Monitors workflow runs, pushes, and branch creation/deletion. Set a channel to receive updates.');
+      await optional('GITHUB_TOKEN', 'GitHub token', values, true);
+      await optional('GITHUB_REPOSITORIES', 'Repositories (comma-separated owner/repo)', values);
+      await optional('GITHUB_CHANNEL_ID', 'GitHub update channel ID', values);
+    } else if (selected === '3') {
+      console.log('  AI chat needs a provider (ollama or openai-compatible) and API base URL.');
+      await optional('ASK_PROVIDER', 'AI provider', values);
+      await optional('ASK_BASE_URL', 'AI API base URL', values);
+      await optional('ASK_MODEL', 'Initial model ID', values);
+      await optional('ASK_API_KEY', 'AI API key', values, true);
+    } else {
+      console.log('  Advanced settings cover roles, channels, private GHCR, and the Linux worker.');
+      await optional('AUTHORIZED_ROLE_IDS', 'Authorized role IDs (comma-separated)', values);
+      await optional('TASK_CHANNEL_ID', 'Task notification channel ID', values);
+      await optional('ERROR_CHANNEL_ID', 'Error channel ID', values);
+      await optional('APPROVAL_CHANNEL_ID', 'Production approval channel ID', values);
+      await optional('GHCR_USERNAME', 'GHCR username', values);
+      await optional('GHCR_TOKEN', 'GHCR read token', values, true);
+      if (os.platform() === 'win32') console.log('  Deployment worker requires rootless Linux Docker; Docker Desktop cannot run it.');
+      else {
+        const socket = process.env.DOCKER_HOST?.replace(/^unix:\/\//, '') || `${process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? 1000}`}/docker.sock`;
+        if (!values.DOCKER_SOCKET_PATH) values.DOCKER_SOCKET_PATH = (await prompt(`  Rootless Docker socket [${socket}]: `)).trim() || socket;
+        let gid = '1000';
+        try { gid = String(fs.statSync(values.DOCKER_SOCKET_PATH).gid); } catch {}
+        if (!values.DOCKER_SOCKET_GID) values.DOCKER_SOCKET_GID = (await prompt(`  Socket group ID [${gid}]: `)).trim() || gid;
+      }
     }
-    for (const name of ['DISCORD_APPLICATION_ID','DISCORD_GUILD_ID']) {
-      if (!isDiscordId(values[name])) throw new Error(`${name} must be a Discord snowflake ID (17–20 digits); configuration was not written.`);
-    }
-    const env = Object.entries(values).map(([k,v])=>`${k}=${v}`).join('\n')+'\n';
-    fs.mkdirSync('config',{recursive:true});
-    fs.mkdirSync('services',{recursive:true});
-    if(!fs.existsSync('config/services.json')) fs.writeFileSync('config/services.json','{\n  "services": {}\n}\n',{mode:0o600,flag:'wx'});
-    if(!fs.existsSync('services/README.md')) fs.writeFileSync('services/README.md','Place locally controlled Compose definitions here. Define only named volumes, provide a healthcheck, and use published images. Never put this directory under a GitHub checkout.\n',{mode:0o600,flag:'wx'});
-    if(dockerComposeAvailable){
-      validateComposeConfig(dockerCommand,composeBase,env);
-      console.log('Docker Compose configuration validated.');
-    }else console.log('Docker Compose configuration validation skipped; Compose v2 is unavailable.');
-    fs.writeFileSync('.env', env, { mode: 0o600, flag: 'w' });
-    if (process.platform !== 'win32') fs.chmodSync('.env', 0o600);
-    console.log('\nWrote .env with a generated 256-bit database key. Keep a protected backup of SQLITE_KEY; losing it makes the database unreadable.');
-    console.log(`Detected architecture: ${platform}. The restricted deployment worker is available as the optional Docker Compose deployment profile. Configure config/services.json before enabling it.`);
-    const launchRl=readline.createInterface({input:process.stdin,output:process.stdout});
-    try {
-      const launch=await launchRl.question('Build and start SANWAN in Docker now? [Y/n] ');
-      if(!/^y(es)?$/i.test(launch||'y')) return;
-      if(!dockerEngineAvailable){console.log('Docker Engine is unavailable. Start Docker Desktop or Docker Engine, then run docker compose up -d --build.');return;}
-      const composeVersion=spawnSync(dockerCommand,['compose','version','--short'],{encoding:'utf8',windowsHide:true});
-      if(composeVersion.status!==0){console.log('Docker Compose v2 is unavailable. Install or enable the Compose plugin, then run docker compose up -d --build.');return;}
-      const args=[...composeBase,'--env-file','.env','up','-d','--build'];
-      const result=spawnSync(dockerCommand,args,{encoding:'utf8',windowsHide:true,stdio:'inherit',env:{...process.env,SANWAN_ENV_FILE:'.env'}});
-      if(result.error) throw result.error;
-      if(result.status!==0) throw new Error(`Docker Compose failed to build or start SANWAN (exit ${result.status}). Configuration was retained.`);
-      console.log('SANWAN is running in Docker. Check status with docker compose ps and logs with docker compose logs -f sanwan.');
-    } finally {launchRl.close();}
-  } finally { rl.close(); }
+  }
+  values.SQLITE_KEY ||= crypto.randomBytes(32).toString('hex');
+  values.WORKER_TOKEN ||= crypto.randomBytes(32).toString('hex');
+  values.DOCKER_SOCKET_PATH ||= os.platform() === 'win32' ? '' : process.env.DOCKER_HOST?.replace(/^unix:\/\//, '') || `${process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? 1000}`}/docker.sock`;
+  values.DOCKER_SOCKET_GID ||= '1000';
+
+  console.log('\n[3/4] Check Docker');
+  const dockerCommand = findDockerCommand();
+  const engine = spawnSync(dockerCommand, ['version', '--format', '{{.Server.Version}}'], { encoding: 'utf8', windowsHide: true });
+  const compose = spawnSync(dockerCommand, ['compose', 'version', '--short'], { encoding: 'utf8', windowsHide: true });
+  const engineReady = engine.status === 0;
+  const composeReady = compose.status === 0;
+  console.log(`  Docker Engine: ${engineReady ? 'ready' : 'unavailable'}`);
+  console.log(`  Docker Compose v2: ${composeReady ? 'ready' : 'unavailable'}`);
+  if (!engineReady) console.log(os.platform() === 'win32' ? '  Start Docker Desktop and wait for its Linux engine to run.' : '  Start Docker Engine before launching SANWAN.');
+  if (!composeReady) console.log('  Install or enable Docker Compose v2 before launching SANWAN.');
+  if (os.platform() === 'win32') console.log('  Deployment worker: requires rootless Linux Docker.');
+  else if (engineReady) {
+    const security = spawnSync(dockerCommand, ['info', '--format', '{{json .SecurityOptions}}'], { encoding: 'utf8', windowsHide: true });
+    let rootless = false;
+    if (security.status === 0) { try { rootless = (JSON.parse(security.stdout) || []).some(x => /rootless/i.test(String(x))); } catch {} }
+    console.log(`  Deployment worker: ${rootless ? 'rootless Docker detected' : 'requires a rootless Docker daemon'}`);
+  }
+  const env = Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n') + '\n';
+  if (composeReady) {
+    validateComposeConfig(dockerCommand, ['compose', '-f', 'docker-compose.yml'], env);
+    console.log('  Compose configuration: valid');
+  } else console.log('  Compose configuration: check skipped');
+  fs.mkdirSync('config', { recursive: true });
+  fs.mkdirSync('services', { recursive: true });
+  if (!fs.existsSync('config/services.json')) fs.writeFileSync('config/services.json', '{\n  "services": {}\n}\n', { mode: 0o600, flag: 'wx' });
+  if (!fs.existsSync('services/README.md')) fs.writeFileSync('services/README.md', 'Place locally controlled Compose definitions here. Define only named volumes, provide a healthcheck, and use published images. Never put this directory under a GitHub checkout.\n', { mode: 0o600, flag: 'wx' });
+  fs.writeFileSync('.env', env, { mode: 0o600, flag: 'w' });
+  if (process.platform !== 'win32') fs.chmodSync('.env', 0o600);
+
+  console.log('\n[4/4] Finish and launch');
+  console.log('  Saved .env and local configuration. Discord is configured.');
+  console.log('  Keep a protected backup of SQLITE_KEY; losing it makes the database unreadable.');
+  if (values.GITHUB_TOKEN && values.GITHUB_REPOSITORIES) console.log('  GitHub monitoring: configured');
+  if (values.ASK_PROVIDER && values.ASK_BASE_URL) console.log('  AI chat: configured');
+  if (!engineReady || !composeReady) {
+    console.log('  When Docker is ready, run: docker compose up -d --build');
+    console.log('  Then try /ping in your Discord server.');
+    return;
+  }
+  if (await choice('  Build and start SANWAN now? 1) Yes  2) Later [1]: ', ['1', '2'], '1') === '2') {
+    console.log('  Start later with: docker compose up -d --build');
+    return;
+  }
+  const result = spawnSync(dockerCommand, ['compose', '-f', 'docker-compose.yml', '--env-file', '.env', 'up', '-d', '--build'], {
+    windowsHide: true, stdio: 'inherit', env: { ...process.env, SANWAN_ENV_FILE: '.env' }
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`Docker Compose failed to build or start SANWAN (exit ${result.status}). Configuration was retained.`);
+  console.log('  SANWAN is running. Try /ping in Discord. Check logs with docker compose logs -f sanwan.');
+  if (await choice('  Connectivity checks: 1) Run checks  2) Skip [1]: ', ['1', '2'], '1') === '1') await runSavedChecks();
 }
-if(require.main===module) main().catch(e=>{ console.error(e.message); process.exitCode=1; });
-module.exports={isDiscordId,validateComposeConfig};
+
+if (require.main === module) main().catch(error => { console.error(error.message); process.exitCode = 1; });
+module.exports = { isDiscordId, parseChoice, discordFieldError, optional, validateComposeConfig };

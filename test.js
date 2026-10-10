@@ -5,14 +5,92 @@ const os = require('node:os');
 const path = require('node:path');
 const { isHealthy, writeHeartbeat, writeHeartbeatAfterReady, clearHeartbeat } = require('./dist/health.js');
 const { classifyGitHubRunChange, hasConfiguredNotificationRoute } = require('./dist/github-events.js');
-const { isDiscordId, validateComposeConfig } = require('./setup.js');
+const { isDiscordId, parseChoice, discordFieldError, optional, validateComposeConfig } = require('./setup.js');
 const { findDockerCommand } = require('./docker-cli.js');
 const { guildCommandRoute } = require('./dist/discord-registration.js');
 const { readContainerLimits } = require('./dist/resource-limits.js');
+const { card, withCard, pingCard, helpCard, deploymentCard, ciStatusCard, responseColors } = require('./dist/responses.js');
+const { EmbedBuilder } = require('discord.js');
+const { parseDeadline } = require('./dist/deadlines.js');
+const { SetupGuidanceError, setupGuidanceCard, commandErrorCard, workerSetupGuidance } = require('./dist/setup-guidance.js');
 
 async function main(){
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'sanwan-test-'));
 try {
+  await require('./github-activity-test.js')(temp);
+  await require('./diagnostics-test.js')(temp);
+  const askSetup=new SetupGuidanceError('ask','AI chat is not configured yet.',['ASK_PROVIDER','ASK_BASE_URL','ASK_MODEL']);
+  const askSetupEmbed=setupGuidanceCard(askSetup).embeds[0];
+  assert.match(askSetupEmbed.title,/AI assistant setup/);
+  for(const setting of ['ASK_PROVIDER','ASK_BASE_URL','ASK_MODEL']) assert.match(askSetupEmbed.fields[0].value,new RegExp(setting));
+  assert.match(askSetupEmbed.fields[0].value,/docker compose up -d --build/);
+  assert.match(askSetupEmbed.fields[0].value,/only if your provider requires authentication; Ollama can run without a key/i);
+  assert.equal(workerSetupGuidance('Daemon is not rootless.' ).area,'deploy');
+  assert.match(workerSetupGuidance('GHCR_USERNAME is required when GHCR_TOKEN is configured.').settings.join(','),/GHCR_USERNAME,GHCR_TOKEN/);
+  assert.equal(workerSetupGuidance('worker completed successfully'),undefined,'configured worker results proceed normally');
+  assert.match(workerSetupGuidance('ghcr.io/acme/app:latest: pull access denied, authentication required').settings.join(','),/GHCR_USERNAME,GHCR_TOKEN/);
+  const safeFailure=commandErrorCard('ask',new Error('provider leaked-token-123 internal stack'));
+  assert.match(safeFailure.embeds[0].description,/redacted logs/);
+  assert.doesNotMatch(safeFailure.embeds[0].description,/leaked-token|internal stack/);
+  assert.equal(safeFailure.embeds[0].color,responseColors.error);
+  const emptyCI=ciStatusCard('acme/app',[],'Initial baseline saved; existing activity was not announced.');
+  assert.match(emptyCI.embeds[0].description,/No workflow runs found/);
+  assert.match(emptyCI.embeds[0].fields[0].value,/baseline saved/);
+  const failedActivityCI=ciStatusCard('acme/app',[],'Activity refresh failed; see local redacted logs.',true);
+  assert.equal(failedActivityCI.embeds[0].color,responseColors.warning);
+  assert.match(failedActivityCI.embeds[0].description,/No workflow runs found/);
+  const serviceGuide=setupGuidanceCard(new SetupGuidanceError('deploy','Service needs registration.',['service entry'],'config/services.json'));
+  assert.match(serviceGuide.embeds[0].fields[0].value,/config\/services\.json/);
+  console.log('PASS: missing integration setup returns safe, command-specific guidance; unexpected failures stay redacted.');
+  const fixed=new Date('2025-12-29T02:30:00.000Z'); // Monday morning in Singapore; still Sunday in UTC.
+  const deadline=(input,now=fixed,tz='Asia/Singapore')=>parseDeadline(input,now,tz);
+  assert.equal(deadline('2025-12-29'),'2025-12-29');
+  assert.equal(deadline('2025-12-29T10:00:00+08:00'),'2025-12-29T10:00:00+08:00');
+  assert.equal(deadline('today'),'2025-12-29');
+  assert.equal(deadline('tomorrow'),'2025-12-30');
+  assert.equal(deadline('next Monday'),'2026-01-05','next same weekday means one week later');
+  for(const [day,expected] of Object.entries({Sunday:'2026-01-04',Monday:'2026-01-05',Tuesday:'2025-12-30',Wednesday:'2025-12-31',Thursday:'2026-01-01',Friday:'2026-01-02',Saturday:'2026-01-03'})) assert.equal(deadline(`next ${day}`),expected);
+  assert.equal(deadline('1d'),'2025-12-30');assert.equal(deadline('9d'),'2026-01-07');
+  assert.equal(deadline('1w'),'2026-01-05');assert.equal(deadline('4w'),'2026-01-26');
+  assert.equal(deadline('  TOMORROW  '),'2025-12-30');
+  assert.equal(deadline('2025-02-29'),undefined,'invalid calendar days must be rejected');
+  assert.equal(deadline('2024-02-29'),'2024-02-29','leap-day dates must be accepted');
+  for(const invalid of ['10d','0d','5w','next funday','in two days','2025-13-01','2025-01-01T10:00:00']) assert.equal(deadline(invalid),undefined,`${invalid} should be rejected`);
+  assert.equal(deadline('tomorrow',new Date('2025-12-31T16:30:00Z'),'America/Los_Angeles'),'2026-01-01','relative dates use the selected timezone');
+  console.log('PASS: task deadlines accept validated ISO values and timezone-aware natural dates.');
+  for (const tone of ['info','success','warning','error']) {
+    const embed=card('Example','Details',tone).embeds[0];
+    assert.equal(embed.color,responseColors[tone]);
+    assert.match(embed.footer.text,/SANWAN/);
+    assert.ok(embed.footer.text.split(' • ')[1],'status must be expressed in text');
+    EmbedBuilder.from(embed).toJSON();
+  }
+  assert.equal(pingCard(-1).embeds[0].fields[1].value,'Not measured yet');
+  assert.equal(pingCard(NaN).embeds[0].fields[1].value,'Not measured yet');
+  assert.equal(pingCard(0).embeds[0].fields[1].value,'0 ms');
+  const bounded=card('x'.repeat(300),'```text\n'+'x'.repeat(9000),'info',Array.from({length:30},()=>({name:'n'.repeat(300),value:'v'.repeat(2000)}))).embeds[0];
+  assert.ok(bounded.title.length<=256 && bounded.description.length<=4096);
+  assert.ok(bounded.fields.length<=25);
+  assert.ok(bounded.fields.every(f=>f.name.length<=256 && f.value.length<=1024));
+  assert.ok(bounded.title.length+bounded.description.length+bounded.footer.text.length+bounded.fields.reduce((n,f)=>n+f.name.length+f.value.length,0)<=6000);
+  assert.match(bounded.description,/shortened/);
+  assert.equal((bounded.description.match(/```/g)||[]).length%2,0,'shortened code blocks must close');
+  assert.match(bounded.footer.text,/omitted/);
+  EmbedBuilder.from(bounded).toJSON();
+  const files=[{name:'export.txt'}], components=[{type:1}];
+  const exportCard=withCard('note',{files,components,ephemeral:true});
+  assert.equal(exportCard.files,files);assert.equal(exportCard.components,components);assert.equal(exportCard.ephemeral,true);
+  assert.match(exportCard.embeds[0].description,/attached/);
+  const replacement=withCard('task','Updated **t0**.');
+  assert.equal(replacement.content,'');assert.equal(replacement.embeds.length,1);
+  assert.equal(replacement.embeds[0].color,responseColors.success);
+  assert.equal(withCard('deploy','You are not authorized to approve production deployments.').embeds[0].color,responseColors.error);
+  const help=JSON.stringify(helpCard());
+  for(const command of ['/logs show','/errors','/status network','/ask question']) assert.ok(help.includes(command));
+  const deployment=deploymentCard('status','api','production',{status:'{"Name":"api-1","State":"running","Health":"healthy"}',active_digest:'repo@sha256:123'});
+  assert.match(deployment.embeds[0].fields.find(f=>f.name==='Status').value,/api-1: running/);
+  assert.ok(deployment.embeds[0].fields.some(f=>f.name==='Active digest'));
+  console.log('PASS: Discord cards preserve delivery options, format health and deployment status, and respect embed limits.');
   const cgroupV2=path.join(temp,'cgroup-v2');fs.mkdirSync(cgroupV2);
   fs.writeFileSync(path.join(cgroupV2,'memory.max'),String(512*1024**2));
   fs.writeFileSync(path.join(cgroupV2,'memory.current'),String(128*1024**2));
@@ -43,7 +121,39 @@ try {
   assert.equal(isDiscordId('12345678901234567890'),true,'20-digit Discord IDs must be accepted');
   assert.equal(isDiscordId('1234567890123456'),false,'short IDs must be rejected');
   assert.equal(isDiscordId('1234567890123456x'),false,'non-numeric IDs must be rejected');
+  assert.match(discordFieldError('DISCORD_TOKEN', ''), /required/);
+  assert.match(discordFieldError('DISCORD_GUILD_ID', 'abc'), /17 to 20 digits/);
+  assert.equal(discordFieldError('DISCORD_APPLICATION_ID', '12345678901234567'), undefined);
+  assert.equal(parseChoice('', ['1','2'], '1'), '1');
+  assert.equal(parseChoice('2', ['1','2'], '1'), '2');
+  assert.equal(parseChoice('3', ['1','2'], '1'), undefined);
   console.log('PASS: setup accepts only Discord snowflake IDs of 17–20 digits.');
+  const keepValues = { ASK_API_KEY: 'saved-secret-value' };
+  let promptCount = 0;
+  const originalLog = console.log;
+  const logged = [];
+  console.log = (...args) => logged.push(args.join(' '));
+  try {
+    await optional('ASK_API_KEY', 'AI API key', keepValues, true, {
+      choice: async () => '1',
+      readSecret: async () => { promptCount++; return 'replacement-secret'; }
+    });
+    assert.equal(keepValues.ASK_API_KEY, 'saved-secret-value');
+    assert.equal(promptCount, 0, 'Keep must not prompt for a replacement');
+    await optional('ASK_API_KEY', 'AI API key', keepValues, true, {
+      choice: async () => '2', readSecret: async () => ''
+    });
+    assert.equal(keepValues.ASK_API_KEY, 'saved-secret-value', 'blank replacement must preserve the saved secret');
+    await optional('ASK_API_KEY', 'AI API key', keepValues, true, {
+      choice: async () => '2', readSecret: async () => 'new-secret-value'
+    });
+    assert.equal(keepValues.ASK_API_KEY, 'new-secret-value', 'replacement must update the saved secret');
+    const skippedValues = {};
+    await optional('ASK_MODEL', 'Initial model ID', skippedValues, false, { prompt: async () => '' });
+    assert.equal(skippedValues.ASK_MODEL, undefined, 'unconfigured optional fields must remain skippable');
+  } finally { console.log = originalLog; }
+  assert.doesNotMatch(logged.join('\n'), /saved-secret-value|replacement-secret|new-secret-value/, 'secret values must never be displayed');
+  console.log('PASS: optional setup values can be kept, replaced, or skipped without displaying secrets.');
   const setupTestDir=path.join(temp,'setup');fs.mkdirSync(setupTestDir);
   const savedEnv='DISCORD_TOKEN=preserved-existing-value\n';
   fs.writeFileSync(path.join(setupTestDir,'.env'),savedEnv,{mode:0o600});

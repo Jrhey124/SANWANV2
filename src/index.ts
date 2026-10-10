@@ -1,3 +1,4 @@
+import { card, withCard, pingCard, helpCard, deploymentCard, ciStatusCard, latencyLabel, shorten } from './responses';
 import 'dotenv/config';
 import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
 import Database from 'better-sqlite3-multiple-ciphers';
@@ -6,8 +7,11 @@ import { join } from 'node:path';
 import * as os from 'node:os';
 import { clearHeartbeat, writeHeartbeat, writeHeartbeatAfterReady } from './health.js';
 import { classifyGitHubRunChange, hasConfiguredNotificationRoute, type GitHubTriggerName } from './github-events.js';
+import { activityPollLabel, initializeActivityStorage, pollRepositoryActivity } from './github-activity.js';
 import { guildCommandRoute } from './discord-registration.js';
 import { readContainerLimits } from './resource-limits.js';
+import { parseDeadline } from './deadlines.js';
+import { SetupGuidanceError, commandErrorCard, workerSetupGuidance } from './setup-guidance.js';
 
 const dataDir = process.env.DATA_DIR ?? 'data';
 const logDir = process.env.LOG_DIR ?? 'logs';
@@ -20,6 +24,13 @@ function log(level: string, message: string) {
   const line = `${new Date().toISOString()} ${level} ${safe}\n`;
   appendFileSync(join(logDir, 'sanwan.log'), line, { mode: 0o600 });
   if (level === 'ERROR') console.error(line.trim());
+}
+function notificationHint(setting:string){return process.env[setting]?'':` Notifications are unavailable until ${setting} is set in .env and SANWAN is restarted.`;}
+function notificationChannelForAction(action:string):string|undefined {
+  if(action==='task.reminders'&&!process.env.TASK_CHANNEL_ID) return 'TASK_CHANNEL_ID';
+  if((action==='notify.github'||action==='github.poll')&&!process.env.GITHUB_CHANNEL_ID) return 'GITHUB_CHANNEL_ID';
+  if(action==='notify.error'&&!process.env.ERROR_CHANNEL_ID) return 'ERROR_CHANNEL_ID';
+  return undefined;
 }
 
 const key = process.env.SQLITE_KEY;
@@ -43,8 +54,8 @@ try{db.exec("ALTER TABLE schedule ADD COLUMN trigger TEXT NOT NULL DEFAULT 'inte
 try{db.exec("ALTER TABLE pending_deployment ADD COLUMN operation TEXT NOT NULL DEFAULT 'release'");}catch(error){if(!(error instanceof Error)||!error.message.includes('duplicate column name'))throw error;}
 try{db.exec('ALTER TABLE pending_deployment ADD COLUMN image_digest TEXT');}catch(error){if(!(error instanceof Error)||!error.message.includes('duplicate column name'))throw error;}
 try{db.exec('ALTER TABLE staging_deployment ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1');}catch(error){if(!(error instanceof Error)||!error.message.includes('duplicate column name'))throw error;}
-const isIsoDeadline = (value: string) => /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:?\d{2}))?$/.test(value) && Number.isFinite(Date.parse(value));
 const askLastRequest=new Map<string,number>();
+initializeActivityStorage(db);
 let askRequestsInFlight=0;
 
 type EnvironmentName='staging'|'production';
@@ -53,33 +64,62 @@ type ServiceRegistry={services:Record<string,ServiceSpec>};
 const servicesConfigPath=process.env.SERVICES_CONFIG??'config/services.json';
 function readServiceRegistry():ServiceRegistry {
   if(!existsSync(servicesConfigPath)) return {services:{}};
-  const data=JSON.parse(readFileSync(servicesConfigPath,'utf8')) as ServiceRegistry;
-  if(!data.services||typeof data.services!=='object') throw new Error('SERVICES_CONFIG must contain a services object.');
+  const source=readFileSync(servicesConfigPath,'utf8');
+  let data:ServiceRegistry;
+  try { data=JSON.parse(source) as ServiceRegistry; }
+  catch { throw new SetupGuidanceError('deploy', 'The local service registry could not be read as JSON.', ['valid services object'], 'config/services.json', ['Check the file syntax and keep each service definition under the top-level `services` key.']); }
+  if(!data.services||typeof data.services!=='object') throw new SetupGuidanceError('deploy', 'The local service registry is missing its services object.', ['services object'], 'config/services.json');
   return data;
 }
-function registeredService(name:string){const registry=readServiceRegistry();if(!Object.hasOwn(registry.services,name))throw new Error(`Service ${name} is not locally registered.`);return registry.services[name];}
+function registeredService(name:string){
+  const registry=readServiceRegistry();
+  if(!Object.hasOwn(registry.services,name)) throw new SetupGuidanceError('deploy', `Service “${name}” has not been registered by the host owner.`, ['service entry'], 'config/services.json', [
+    'Add the service and its staging and production Compose mappings, then add its Compose file under `services/`.'
+  ]);
+  return registry.services[name];
+}
 async function workerCall(body:Record<string,unknown>){
   const workerToken=process.env.WORKER_TOKEN;
   const url=process.env.WORKER_URL;
-  if(!workerToken||workerToken.length<64||!url) throw new Error('Deployment worker is not enabled. Start the worker profile and configure WORKER_TOKEN.');
-  const response=await fetch(`${url}/v1/action`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${workerToken}`},body:JSON.stringify(body),signal:AbortSignal.timeout(360_000)});
+  if(!workerToken||workerToken.length<64||!url) throw new SetupGuidanceError('deploy', 'Deployment actions are disabled because the worker is not configured.', [...(!workerToken||workerToken.length<64?['WORKER_TOKEN']:[]), ...(!url?['WORKER_URL']:[]), 'DOCKER_SOCKET_PATH', 'DOCKER_SOCKET_GID'], '.env', [
+    'The worker requires rootless Linux Docker and its socket settings: `DOCKER_SOCKET_PATH` and `DOCKER_SOCKET_GID`.',
+    'Enable it with `docker compose -f docker-compose.yml -f docker-compose.worker.yml --profile deployment up -d --build`.'
+  ]);
+  let response:Response;
+  try {
+    response=await fetch(`${url}/v1/action`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${workerToken}`},body:JSON.stringify(body),signal:AbortSignal.timeout(360_000)});
+  } catch(error) {
+    const code=(error as NodeJS.ErrnoException).cause && ((error as NodeJS.ErrnoException).cause as NodeJS.ErrnoException).code;
+    if(code==='ECONNREFUSED'||code==='ENOTFOUND') throw new SetupGuidanceError('deploy', 'The deployment worker is not reachable. It may not be running or its worker network is unavailable.', ['WORKER_TOKEN', 'DOCKER_SOCKET_PATH', 'DOCKER_SOCKET_GID'], '.env', [
+      'The worker needs rootless Linux Docker and its socket settings: `DOCKER_SOCKET_PATH` and `DOCKER_SOCKET_GID`.',
+      'Enable it with `docker compose -f docker-compose.yml -f docker-compose.worker.yml --profile deployment up -d --build`.'
+    ]);
+    throw error;
+  }
   const result=await response.json() as {error?:string;[key:string]:unknown};
-  if(!response.ok) throw new Error(result.error??`Deployment worker returned HTTP ${response.status}.`);
+  if(!response.ok) {
+    const guide = result.error ? workerSetupGuidance(result.error) : undefined;
+    if (guide) throw guide;
+    throw new Error(result.error??`Deployment worker returned HTTP ${response.status}.`);
+  }
   return result;
 }
 async function verifyRelease(service:ServiceSpec,environment:EnvironmentName,sha:string){
   if(!/^[a-f0-9]{40}$/i.test(sha)) throw new Error('Commit must be a full 40-character SHA.');
   const allowed=(process.env.GITHUB_REPOSITORIES??'').split(',').map(s=>s.trim()).filter(Boolean);
-  if(!allowed.includes(service.github_repository)) throw new Error('Service repository is not in the local GitHub allowlist.');
-  if(!process.env.GITHUB_TOKEN) throw new Error('GITHUB_TOKEN is required to verify a release.');
+  if(!allowed.length) throw new SetupGuidanceError('ci', 'GitHub Actions monitoring is not configured.', ['GITHUB_TOKEN', 'GITHUB_REPOSITORIES']);
+  if(!process.env.GITHUB_TOKEN) throw new SetupGuidanceError('ci', 'GitHub credentials are missing, so SANWAN cannot verify this release.', ['GITHUB_TOKEN']);
+  if(!allowed.includes(service.github_repository)) throw new SetupGuidanceError('ci', `Repository ${service.github_repository} is not in the GitHub allowlist.`, ['GITHUB_REPOSITORIES']);
   const branch=environment==='staging'?service.staging_branch:service.production_branch;
   const response=await fetch(`https://api.github.com/repos/${service.github_repository}/actions/runs?head_sha=${sha}&per_page=100`,{headers:{Authorization:`Bearer ${process.env.GITHUB_TOKEN}`,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},signal:AbortSignal.timeout(15000)});
+  if(response.status===401||response.status===403) throw new SetupGuidanceError('ci', 'GitHub rejected the configured token or it lacks Actions access.', ['GITHUB_TOKEN'], '.env', ['Use a token with read access to the repository and workflow runs.']);
   if(!response.ok) throw new Error(`GitHub could not verify the release (HTTP ${response.status}).`);
   const payload=await response.json() as {workflow_runs?:Array<{name:string;head_branch:string;head_sha:string;status:string;conclusion:string|null;event:string;run_number:number;head_repository?:{full_name:string}|null}>};
   const validRuns=(payload.workflow_runs??[]).filter(run=>run.name===service.workflow_name&&run.event==='push'&&run.head_repository?.full_name.toLowerCase()===service.github_repository.toLowerCase()&&run.head_branch===branch&&run.status==='completed'&&run.conclusion==='success');
   if(!validRuns.some(run=>run.head_sha.toLowerCase()===sha.toLowerCase())) throw new Error(`No successful ${service.workflow_name} push run for ${sha.slice(0,7)} on configured ${branch} branch.`);
   if(environment==='production'){
     const latestResponse=await fetch(`https://api.github.com/repos/${service.github_repository}/actions/runs?branch=${encodeURIComponent(branch)}&per_page=100`,{headers:{Authorization:`Bearer ${process.env.GITHUB_TOKEN}`,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},signal:AbortSignal.timeout(15000)});
+    if(latestResponse.status===401||latestResponse.status===403) throw new SetupGuidanceError('ci', 'GitHub rejected the configured token or it lacks Actions access.', ['GITHUB_TOKEN'], '.env', ['Use a token with read access to the repository and workflow runs.']);
     if(!latestResponse.ok) throw new Error(`GitHub could not confirm the latest production candidate (HTTP ${latestResponse.status}).`);
     const latestPayload=await latestResponse.json() as {workflow_runs?:Array<{name:string;head_branch:string;head_sha:string;event:string;run_number:number;status:string;conclusion:string|null;head_repository?:{full_name:string}|null}>};
     const latest=(latestPayload.workflow_runs??[]).filter(run=>run.name===service.workflow_name&&run.event==='push'&&run.head_repository?.full_name.toLowerCase()===service.github_repository.toLowerCase()&&run.head_branch===branch&&run.status==='completed'&&run.conclusion==='success').sort((a,b)=>b.run_number-a.run_number)[0];
@@ -89,13 +129,16 @@ async function verifyRelease(service:ServiceSpec,environment:EnvironmentName,sha
 function askConfig(){
   const provider=process.env.ASK_PROVIDER;
   const base=process.env.ASK_BASE_URL;
-  if(!provider||!base) throw new Error('AI chat is disabled. Configure ASK_PROVIDER and ASK_BASE_URL locally.');
-  if(!['ollama','openai-compatible'].includes(provider)) throw new Error('ASK_PROVIDER must be ollama or openai-compatible.');
-  const url=new URL(base);
-  if(!['http:','https:'].includes(url.protocol)||url.username||url.password) throw new Error('ASK_BASE_URL must be an HTTP(S) URL without embedded credentials.');
-  if(process.env.ASK_API_KEY&&url.protocol==='http:'&&!['localhost','127.0.0.1','::1','ollama','host.docker.internal'].includes(url.hostname)) throw new Error('Use HTTPS when ASK_API_KEY is sent to a non-local AI provider.');
   const model=(db.prepare("SELECT value FROM setting WHERE key='ask_model'").get() as {value:string}|undefined)?.value||process.env.ASK_MODEL;
-  if(!model) throw new Error('Set ASK_MODEL before using /ask.');
+  if(!provider||!base) throw new SetupGuidanceError('ask', 'AI chat is not configured yet.', [...(!provider ? ['ASK_PROVIDER'] : []), ...(!base ? ['ASK_BASE_URL'] : []), ...(!model ? ['ASK_MODEL'] : [])], '.env', [
+    'Choose `ollama` or `openai-compatible`.'
+  ]);
+  if(!['ollama','openai-compatible'].includes(provider)) throw new SetupGuidanceError('ask', 'The AI provider value is not supported.', ['ASK_PROVIDER'], '.env', ['Use `ollama` or `openai-compatible`.']);
+  let url:URL;
+  try { url=new URL(base); } catch { throw new SetupGuidanceError('ask', 'The configured AI base URL is invalid.', ['ASK_BASE_URL']); }
+  if(!['http:','https:'].includes(url.protocol)||url.username||url.password) throw new SetupGuidanceError('ask', 'The AI base URL must be an HTTP(S) URL without embedded credentials.', ['ASK_BASE_URL']);
+  if(process.env.ASK_API_KEY&&url.protocol==='http:'&&!['localhost','127.0.0.1','::1','ollama','host.docker.internal'].includes(url.hostname)) throw new SetupGuidanceError('ask', 'The configured remote AI provider uses a key over an insecure connection.', ['ASK_BASE_URL'], '.env', ['Use an HTTPS provider URL.']);
+  if(!model) throw new SetupGuidanceError('ask', 'No AI model is configured.', ['ASK_MODEL']);
   return {provider,base:base.replace(/\/+$/,''),model};
 }
 async function askModels(){
@@ -113,6 +156,7 @@ async function askProvider(question:string){
   if(process.env.ASK_API_KEY) headers.Authorization=`Bearer ${process.env.ASK_API_KEY}`;
   const body=config.provider==='ollama'?{model:config.model,messages:[{role:'user',content:question}],stream:false}:{model:config.model,messages:[{role:'user',content:question}],stream:false};
   const response=await fetch(url,{method:'POST',headers,body:JSON.stringify(body),signal:AbortSignal.timeout(90000)});
+  if((response.status===401||response.status===403)&&config.provider!=='ollama') throw new SetupGuidanceError('ask', 'The AI provider rejected its credentials. If this provider requires authentication, set or check `ASK_API_KEY`; Ollama can run without a key.', ['ASK_API_KEY'], '.env');
   if(!response.ok) throw new Error(`AI provider request returned HTTP ${response.status}.`);
   const payload=await response.json() as {message?:{content?:string};choices?:Array<{message?:{content?:string}}>};
   const answer=config.provider==='ollama'?payload.message?.content:payload.choices?.[0]?.message?.content;
@@ -154,7 +198,7 @@ const commands = [
     .addSubcommand(s => s.setName('create').setDescription('Create a task')
       .addStringOption(o => o.setName('title').setDescription('Short task title').setRequired(true).setMaxLength(120))
       .addStringOption(o => o.setName('assignee').setDescription('Discord user, name, or team').setRequired(true).setMaxLength(100))
-      .addStringOption(o => o.setName('deadline').setDescription('ISO date or timestamp with timezone').setRequired(true).setMaxLength(40))
+      .addStringOption(o => o.setName('deadline').setDescription('ISO date or today, tomorrow, next Monday, 3d, or 2w').setRequired(true).setMaxLength(40))
       .addStringOption(o => o.setName('description').setDescription('Task details').setMaxLength(1000)))
     .addSubcommand(s => s.setName('list').setDescription('List tasks; defaults to all tasks')
       .addStringOption(o=>o.setName('scope').setDescription('Task list scope (default: all)').addChoices({name:'all',value:'all'},{name:'open',value:'open'})))
@@ -162,7 +206,7 @@ const commands = [
       .addStringOption(o => o.setName('id').setDescription('Task ID such as t0').setRequired(true))
       .addStringOption(o => o.setName('status').setDescription('New status').addChoices({name:'open',value:'open'},{name:'in progress',value:'in-progress'},{name:'blocked',value:'blocked'},{name:'done',value:'done'}))
       .addStringOption(o => o.setName('assignee').setDescription('New assignee').setMaxLength(100))
-      .addStringOption(o => o.setName('deadline').setDescription('New ISO date or timestamp').setMaxLength(40)))
+      .addStringOption(o => o.setName('deadline').setDescription('New ISO date or today, tomorrow, next Monday, 3d, or 2w').setMaxLength(40)))
     .addSubcommand(s => s.setName('describe').setDescription('Set task description')
       .addStringOption(o => o.setName('id').setDescription('Task ID such as t0').setRequired(true))
       .addStringOption(o => o.setName('description').setDescription('Task details').setRequired(true).setMaxLength(1000)))
@@ -231,11 +275,15 @@ let githubPollRunning = false;
 let githubErrorActive = false;
 type GitHubTriggerEvent={trigger:GitHubTriggerName;message:string};
 async function postChannel(channelId: string | undefined, content: string) {
-  if (!channelId) return;
+  if (!channelId) return false;
   try {
     const channel = await client.channels.fetch(channelId);
-    if (channel && channel.isTextBased() && 'send' in channel) await channel.send({content:content.slice(0,1900),allowedMentions:{parse:[]}});
+    if (channel && channel.isTextBased() && 'send' in channel) {
+      await channel.send({content:content.slice(0,1900),allowedMentions:{parse:[]}});
+      return true;
+    }
   } catch (error) { log('ERROR',`Channel notification failed: ${error instanceof Error?error.message:'unknown error'}`); }
+  return false;
 }
 async function reportSchedulerError(context:string,error:unknown){
   const detail=error instanceof Error?error.message:'unknown error';
@@ -250,6 +298,18 @@ async function pollGithub() {
   const baseline=db.prepare("SELECT value FROM setting WHERE key='github_baseline' ").get() as {value:string}|undefined;
   let succeeded=0;
   const triggerEvents:GitHubTriggerEvent[]=[];
+  for (const repo of repos) {
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) continue;
+    try {
+      await pollRepositoryActivity(db,repo,process.env.GITHUB_TOKEN!,async message => {
+        // Monitor without a channel, but avoid replaying that history when one is added later.
+        if (!process.env.GITHUB_CHANNEL_ID) return true;
+        return postChannel(process.env.GITHUB_CHANNEL_ID,message);
+      });
+    } catch (error) {
+      log('ERROR',error instanceof Error ? error.message : `GitHub activity polling failed for ${repo}.`);
+    }
+  }
   try {
     for(const repo of repos){
       if(!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) { log('ERROR',`Invalid configured GitHub repository: ${repo}`); continue; }
@@ -415,17 +475,17 @@ client.on('interactionCreate', async interaction => {
   if(interaction.isButton()&&interaction.customId.startsWith('deploy-approve:')){
     const match=/^deploy-approve:(\d+)$/.exec(interaction.customId);
     if(!match)return;
-    if(!authorized(interaction)){await interaction.reply({content:'You are not authorized to approve production deployments.',ephemeral:true});return;}
+    if(!authorized(interaction)){await interaction.reply(withCard('deploy', {content:'You are not authorized to approve production deployments.',ephemeral:true}));return;}
     const id=Number(match[1]);
     const pending=db.prepare('SELECT id,service,environment,sha,requester,status,expires_at,operation,image_digest FROM pending_deployment WHERE id=?').get(id) as {id:number;service:string;environment:EnvironmentName;sha:string;requester:string;status:string;expires_at:string;operation:string;image_digest:string|null}|undefined;
-    if(!pending||pending.status!=='pending'){await interaction.reply({content:'This deployment approval is no longer pending.',ephemeral:true});return;}
-    if(pending.requester===interaction.user.id){await interaction.reply({content:'A different authorized user must approve this release.',ephemeral:true});return;}
+    if(!pending||pending.status!=='pending'){await interaction.reply(withCard('deploy', {content:'This deployment approval is no longer pending.',ephemeral:true}));return;}
+    if(pending.requester===interaction.user.id){await interaction.reply(withCard('deploy', {content:'A different authorized user must approve this release.',ephemeral:true}));return;}
     if(Date.parse(pending.expires_at)<=Date.now()){
       db.prepare("UPDATE pending_deployment SET status='expired' WHERE id=? AND status='pending'").run(id);
-      await interaction.reply({content:'This approval has expired.',ephemeral:true});return;
+      await interaction.reply(withCard('deploy', {content:'This approval has expired.',ephemeral:true}));return;
     }
     const claimed=db.prepare("UPDATE pending_deployment SET status='deploying' WHERE id=? AND status='pending' AND expires_at>?").run(id,new Date().toISOString());
-    if(!claimed.changes){await interaction.reply({content:'This approval was already handled.',ephemeral:true});return;}
+    if(!claimed.changes){await interaction.reply(withCard('deploy', {content:'This approval was already handled.',ephemeral:true}));return;}
     await interaction.deferUpdate();
     try{
       const service=registeredService(pending.service);
@@ -441,43 +501,55 @@ client.on('interactionCreate', async interaction => {
       }
       db.prepare("UPDATE pending_deployment SET status='approved' WHERE id=?").run(id);
       const releaseLabel=pending.operation==='rollback'?pending.sha.slice(0,19):pending.sha.slice(0,7);
-      await interaction.message.edit({content:`Production ${pending.operation==='rollback'?'rollback':'release'} approved by <@${interaction.user.id}> and completed. **${pending.service}** · ${releaseLabel} · ${String(result.digest??'digest unavailable')}`,components:[]});
-      await interaction.followUp({content:`Production ${pending.operation} is healthy.`,ephemeral:true});
+      await interaction.message.edit({ ...card('Production deployment completed', `Approved by <@${interaction.user.id}>.`, 'success', [{ name: 'Service', value: pending.service }, { name: 'Release', value: releaseLabel }, { name: 'Image digest', value: String(result.digest??'digest unavailable') }]), components: [] });
+      await interaction.followUp(withCard('deploy', {content:`Production ${pending.operation} is healthy.`,ephemeral:true}));
     }catch(error){
       const message=error instanceof Error?error.message:'Deployment failed.';
       db.prepare("UPDATE pending_deployment SET status='failed' WHERE id=?").run(id);
       log('ERROR',`Production approval ${id} failed: ${message}`);
-      await interaction.message.edit({content:`Production ${pending.operation} failed for **${pending.service}** · ${pending.operation==='rollback'?pending.sha.slice(0,19):pending.sha.slice(0,7)}. See SANWAN logs.`,components:[]}).catch(()=>undefined);
-      await interaction.followUp({content:'The release was not completed. Check the SANWAN error log.',ephemeral:true});
+      await interaction.message.edit({ ...commandErrorCard('deploy', error, 'The release was not completed. Check the redacted SANWAN logs.'), components: [] }).catch(()=>undefined);
+      await interaction.followUp({ ...commandErrorCard('deploy', error, 'The release was not completed. Check the redacted SANWAN logs.'), ephemeral:true });
     }
     return;
   }
   if (!interaction.isChatInputCommand()) return;
   try {
     if (!interaction.inGuild() || interaction.guildId !== process.env.DISCORD_GUILD_ID) {
-      await interaction.reply({ content: 'This SANWAN installation is restricted to its configured Discord server.', ephemeral: true }); return;
+      await interaction.reply(withCard(interaction.commandName, { content: 'This SANWAN installation is restricted to its configured Discord server.', ephemeral: true })); return;
     }
     if (interaction.commandName === 'ping') {
       db.prepare("INSERT INTO event(source,message) VALUES('discord','ping')").run();
-      await interaction.reply({ content: `Pong. Database ready; gateway latency ${client.ws.ping} ms.`, ephemeral: true });
+      await interaction.reply({ ...pingCard(client.ws.ping), ephemeral: true });
     } else if (interaction.commandName === 'help') {
-      await interaction.reply({ content: '**SANWAN** · `/ping` · `/ci status` · `/deploy simulate|release|status|start|stop|restart|rollback` · `/task` · `/note` · `/schedule`\nDeployment services must be registered by the host owner. Production changes require approval from a second authorized user.', ephemeral: true });
+      await interaction.reply({ ...helpCard(), ephemeral: true });
     } else if (interaction.commandName === 'ci') {
-      if (!authorized(interaction)) { await interaction.reply({ content: 'You are not authorized to inspect CI for this server.', ephemeral: true }); return; }
+      if (!authorized(interaction)) { await interaction.reply(withCard(interaction.commandName, { content: 'You are not authorized to inspect CI for this server.', ephemeral: true })); return; }
       await interaction.deferReply({ ephemeral: true });
       const repo = interaction.options.getString('repository', true);
       const allowed = (process.env.GITHUB_REPOSITORIES ?? '').split(',').map(s => s.trim()).filter(Boolean);
-      if (!allowed.includes(repo)) { await interaction.editReply('Repository is not in the local GITHUB_REPOSITORIES allowlist.'); return; }
-      if (!process.env.GITHUB_TOKEN) { await interaction.editReply('GitHub polling is configured only after GITHUB_TOKEN is added to .env.'); return; }
+      if (!allowed.length) throw new SetupGuidanceError('ci', 'GitHub Actions monitoring is not configured.', ['GITHUB_TOKEN', 'GITHUB_REPOSITORIES']);
+      if (!process.env.GITHUB_TOKEN) throw new SetupGuidanceError('ci', 'GitHub credentials are missing.', ['GITHUB_TOKEN']);
+      if (!allowed.includes(repo)) throw new SetupGuidanceError('ci', `Repository “${repo}” is not in the GitHub allowlist.`, ['GITHUB_REPOSITORIES']);
+      let activityStatus = 'Activity refresh failed; see local redacted logs.';
+      let activityFailed = false;
+      try {
+        const result = await pollRepositoryActivity(db,repo,process.env.GITHUB_TOKEN,async message => {
+          if (!process.env.GITHUB_CHANNEL_ID) return true;
+          return postChannel(process.env.GITHUB_CHANNEL_ID,message);
+        });
+        activityStatus = activityPollLabel(result,Boolean(process.env.GITHUB_CHANNEL_ID));
+      } catch (error) {
+        activityFailed = true;
+        log('ERROR','GitHub activity status refresh failed for ' + repo + ': ' + (error instanceof Error?error.message:'unknown error'));
+      }
       const response = await fetch(`https://api.github.com/repos/${repo}/actions/runs?per_page=5`, { headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } });
+      if (response.status === 401 || response.status === 403) throw new SetupGuidanceError('ci', 'GitHub rejected the configured token or it lacks Actions access.', ['GITHUB_TOKEN'], '.env', ['Use a token with read access to the repository and workflow runs.']);
       if (!response.ok) throw new Error(`GitHub API returned HTTP ${response.status}`);
       const payload = await response.json() as { workflow_runs?: Array<{name:string;status:string;conclusion:string|null;head_branch:string;head_sha:string;html_url:string}> };
       const runs = payload.workflow_runs ?? [];
-      if (!runs.length) { await interaction.editReply(`No workflow runs found for ${repo}.`); return; }
-      const content = runs.map(r => `• **${r.name}** · ${r.status}${r.conclusion ? ` / ${r.conclusion}` : ''} · ${r.head_branch} @ ${r.head_sha.slice(0,7)} · <${r.html_url}>`).join('\n');
-      await interaction.editReply(content.slice(0, 1900));
+      await interaction.editReply(ciStatusCard(repo,runs,activityStatus,activityFailed));
     } else if (interaction.commandName === 'deploy') {
-      if (!authorized(interaction)) { await interaction.reply({ content: 'You are not authorized to inspect or operate deployments.', ephemeral: true }); return; }
+      if (!authorized(interaction)) { await interaction.reply(withCard(interaction.commandName, { content: 'You are not authorized to inspect or operate deployments.', ephemeral: true })); return; }
       const action=interaction.options.getSubcommand();
       const serviceName=interaction.options.getString('service',true);
       const environment=interaction.options.getString('environment',true) as EnvironmentName;
@@ -485,7 +557,7 @@ client.on('interactionCreate', async interaction => {
       if(action==='simulate'){
         const sha=interaction.options.getString('commit')??undefined;
         const result=await workerCall({operation:'simulate',service:serviceName,environment,sha});
-        await interaction.reply({content:`Simulation passed for **${serviceName}/${environment}**. No service was changed. ${String(result.planned_image??'Compose security checks passed.')}`,ephemeral:true});
+        await interaction.reply({ ...deploymentCard('simulate', serviceName, environment, result), ephemeral: true });
       }else if(action==='release'){
         const sha=interaction.options.getString('commit',true).toLowerCase();
         await interaction.deferReply({ephemeral:true});
@@ -493,7 +565,7 @@ client.on('interactionCreate', async interaction => {
         if(environment==='staging'){
           const result=await workerCall({operation:'deploy',service:serviceName,environment,sha});
           db.prepare("INSERT INTO staging_deployment(service,sha,status,detail,attempts) VALUES(?,?,'healthy','manual successful deployment',1) ON CONFLICT(service,sha) DO UPDATE SET status='healthy',detail='manual successful deployment',updated_at=CURRENT_TIMESTAMP").run(serviceName,sha);
-          await interaction.editReply(`Staging release is healthy · **${serviceName}** · ${sha.slice(0,7)} · ${String(result.digest??'digest unavailable')}.`);
+          await interaction.editReply(deploymentCard('release', serviceName, environment, { ...result, active_sha: sha }));
         }else{
           const prepared=await workerCall({operation:'prepare',service:serviceName,environment,sha});
           const digest=String(prepared.digest??'');
@@ -506,16 +578,16 @@ client.on('interactionCreate', async interaction => {
           const approvalId=Number(insert.lastInsertRowid);
           const button=new ButtonBuilder().setCustomId(`deploy-approve:${approvalId}`).setLabel('Approve production release').setStyle(ButtonStyle.Danger);
           try{
-            await channel.send({content:`Production deployment approval requested by <@${interaction.user.id}>.\nService: **${serviceName}**\nCommit: **${sha}**\nImage digest: **${digest}**\nWorkflow: **${service.workflow_name}** passed on **${service.production_branch}**.\nApproval expires: ${expires}. A different authorized user must approve.`,components:[new ActionRowBuilder<ButtonBuilder>().addComponents(button)],allowedMentions:{parse:[]}});
+            await channel.send({ ...card('Production release • Approval pending', `Requested by <@${interaction.user.id}>. A different authorized user must approve.`, 'warning', [{ name: 'Service', value: serviceName }, { name: 'Commit', value: sha }, { name: 'Image digest', value: digest }, { name: 'Workflow', value: `${service.workflow_name} passed on ${service.production_branch}` }, { name: 'Expires', value: `<t:${Math.floor(Date.parse(expires)/1000)}:F>` }]), components:[new ActionRowBuilder<ButtonBuilder>().addComponents(button)] });
           }catch(error){db.prepare("UPDATE pending_deployment SET status='failed' WHERE id=?").run(approvalId);throw error;}
-          await interaction.editReply('Production approval request posted. The exact commit and image are locked to this request.');
+          await interaction.editReply(withCard(interaction.commandName, 'Production approval request posted. The exact commit and image are locked to this request.'));
         }
       }else{
         if(action==='rollback'&&environment==='production'){
           await interaction.deferReply({ephemeral:true});
           const current=await workerCall({operation:'status',service:serviceName,environment});
           const previous=String(current.previous_digest??'');
-          if(!previous.startsWith(`${service.image_repository}@sha256:`)){await interaction.editReply('No previous healthy production digest is available to approve.');return;}
+          if(!previous.startsWith(`${service.image_repository}@sha256:`)){await interaction.editReply(withCard(interaction.commandName, 'No previous healthy production digest is available to approve.'));return;}
           db.prepare("UPDATE pending_deployment SET status='superseded' WHERE service=? AND environment='production' AND status='pending'").run(serviceName);
           const expires=new Date(Date.now()+24*60*60*1000).toISOString();
           const insert=db.prepare("INSERT INTO pending_deployment(service,environment,sha,requester,status,expires_at,operation) VALUES(?,'production',?,?,'pending',?,'rollback')").run(serviceName,previous,interaction.user.id,expires);
@@ -523,13 +595,13 @@ client.on('interactionCreate', async interaction => {
           const channel=process.env.APPROVAL_CHANNEL_ID?await client.channels.fetch(process.env.APPROVAL_CHANNEL_ID):interaction.channel;
           if(!channel||!channel.isTextBased()||!('send' in channel)){db.prepare("UPDATE pending_deployment SET status='failed' WHERE id=?").run(approvalId);throw new Error('The configured approval channel is unavailable.');}
           const button=new ButtonBuilder().setCustomId(`deploy-approve:${approvalId}`).setLabel('Approve production rollback').setStyle(ButtonStyle.Danger);
-          try{await channel.send({content:`Production rollback approval requested by <@${interaction.user.id}>.\nService: **${serviceName}**\nRestore digest: **${previous}**\nApproval expires: ${expires}. A different authorized user must approve.`,components:[new ActionRowBuilder<ButtonBuilder>().addComponents(button)],allowedMentions:{parse:[]}});}
+          try{await channel.send({ ...card('Production rollback • Approval pending', `Requested by <@${interaction.user.id}>. A different authorized user must approve.`, 'warning', [{ name: 'Service', value: serviceName }, { name: 'Restore digest', value: previous }, { name: 'Expires', value: `<t:${Math.floor(Date.parse(expires)/1000)}:F>` }]), components:[new ActionRowBuilder<ButtonBuilder>().addComponents(button)] });}
           catch(error){db.prepare("UPDATE pending_deployment SET status='failed' WHERE id=?").run(approvalId);throw error;}
-          await interaction.editReply('Production rollback approval request posted. It is bound to the previous digest shown in the approval message.');return;
+          await interaction.editReply(withCard(interaction.commandName, 'Production rollback approval request posted. It is bound to the previous digest shown in the approval message.'));return;
         }
         await interaction.deferReply({ephemeral:true});
         const result=await workerCall({operation:action,service:serviceName,environment});
-        await interaction.editReply(JSON.stringify(result).slice(0,1900));
+        await interaction.editReply(deploymentCard(action, serviceName, environment, result));
       }
     } else if (interaction.commandName === 'task') {
       const action = interaction.options.getSubcommand();
@@ -545,47 +617,50 @@ client.on('interactionCreate', async interaction => {
       if (action === 'create') {
         const title=interaction.options.getString('title',true).trim();
         const assignee=interaction.options.getString('assignee',true).trim();
-        const deadline=interaction.options.getString('deadline',true).trim();
-        if (!isIsoDeadline(deadline)) { await interaction.reply({content:'Deadline must be YYYY-MM-DD or an ISO timestamp with timezone.',ephemeral:true}); return; }
+        const deadlineInput=interaction.options.getString('deadline',true).trim();
+        const deadline=parseDeadline(deadlineInput);
+        if (!deadline) { await interaction.reply(withCard(interaction.commandName, {content:'Enter an ISO date or timestamp with timezone, or try today, tomorrow, next Monday, 3d, or 2w (1–9d, 1–4w).',ephemeral:true})); return; }
         const description=interaction.options.getString('description') ?? '';
         const result=db.prepare('INSERT INTO task(title,assignee,deadline,description) VALUES(?,?,?,?)').run(title,assignee,deadline,description);
         const taskId=`t${Number(result.lastInsertRowid)-1}`;
         db.prepare('INSERT INTO event(source,message) VALUES(?,?)').run('task',`create ${taskId} by ${interaction.user.id}`);
-        await interaction.reply({content:`Created **${taskId}** · ${title} · assigned to ${assignee} · due ${deadline}.`,ephemeral:true});
+        await interaction.reply({ ...card('Task created', title + notificationHint('TASK_CHANNEL_ID'), 'success', [{ name: 'ID', value: taskId, inline: true }, { name: 'Assigned to', value: assignee, inline: true }, { name: 'Due', value: deadline }]), ephemeral: true });
         await notifyTask(`Task **${taskId}** created: ${title} · ${assignee} · due ${deadline}.`);
       } else if (action === 'list') {
         const scope=interaction.options.getString('scope')??'all';
         const rows=(scope==='open'
           ?db.prepare("SELECT id,title,assignee,deadline,status,description FROM task WHERE status!='done' ORDER BY deadline LIMIT 20").all()
           :db.prepare('SELECT id,title,assignee,deadline,status,description FROM task ORDER BY deadline LIMIT 20').all()) as Array<{id:number;title:string;assignee:string;deadline:string;status:string;description:string}>;
-        const content=rows.length?rows.map(t=>`**t${t.id-1}** · ${t.title} · ${t.assignee} · ${t.status} · due ${t.deadline}${t.description?` · ${t.description.slice(0,50)}`:''}`).join('\n'):'No open tasks.';
-        await interaction.reply({content:content.slice(0,1900),ephemeral:true});
+        await interaction.reply({ ...card('Tasks', rows.length ? `Showing ${rows.length} ${scope === 'open' ? 'open ' : ''}tasks (up to 20).` : `No ${scope === 'open' ? 'open ' : ''}tasks. Create one with /task create.`, 'info', rows.map(t => ({
+          name: `t${t.id-1} • ${t.title}`, value: `Status: **${t.status}**\nAssigned to: ${t.assignee}\nDue: ${t.deadline}${t.description ? `\n${t.description}` : ''}`
+        }))), ephemeral: true });
       } else if (action === 'update' || action === 'describe' || action === 'bump' || action === 'remove') {
         const id=interaction.options.getString('id',true);
         const task=getTask(id);
-        if (!task) { await interaction.reply({content:`Task **${id}** was not found.`,ephemeral:true}); return; }
+        if (!task) { await interaction.reply(withCard(interaction.commandName, {content:`Task **${id}** was not found.`,ephemeral:true})); return; }
         const label=`t${task.id-1}`;
         if (action === 'remove') {
-          if (!authorized(interaction)) { await interaction.reply({content:'Only the server owner or an authorized role can remove tasks.',ephemeral:true}); return; }
+          if (!authorized(interaction)) { await interaction.reply(withCard(interaction.commandName, {content:'Only the server owner or an authorized role can remove tasks.',ephemeral:true})); return; }
           db.prepare('DELETE FROM task WHERE id=?').run(task.id);
-          await interaction.reply({content:`Removed **${label}** · ${task.title}.`,ephemeral:true});
+          await interaction.reply(withCard(interaction.commandName, {content:`Removed **${label}** · ${task.title}.${notificationHint('TASK_CHANNEL_ID')}`,ephemeral:true}));
           await notifyTask(`Task **${label}** removed: ${task.title}.`);
         } else if (action === 'bump') {
-          await interaction.reply({content:`Reminder sent for **${label}** · ${task.title}.`,ephemeral:true});
+          await interaction.reply(withCard(interaction.commandName, {content:`Reminder sent for **${label}** · ${task.title}.${notificationHint('TASK_CHANNEL_ID')}`,ephemeral:true}));
           await notifyTask(`Reminder · **${label}** ${task.title} · ${task.assignee} · due ${task.deadline} · ${task.status}.`);
         } else if (action === 'describe') {
           const description=interaction.options.getString('description',true);
           db.prepare('UPDATE task SET description=? WHERE id=?').run(description,task.id);
-          await interaction.reply({content:`Updated description for **${label}**.`,ephemeral:true});
+          await interaction.reply(withCard(interaction.commandName, {content:`Updated description for **${label}**.${notificationHint('TASK_CHANNEL_ID')}`,ephemeral:true}));
           await notifyTask(`Task **${label}** updated: description changed.`);
         } else {
           const status=interaction.options.getString('status');
           const assignee=interaction.options.getString('assignee');
-          const deadline=interaction.options.getString('deadline');
-          if (!status && !assignee && !deadline) { await interaction.reply({content:'Provide at least one field to update.',ephemeral:true}); return; }
-          if (deadline && !isIsoDeadline(deadline)) { await interaction.reply({content:'Deadline must be YYYY-MM-DD or an ISO timestamp with timezone.',ephemeral:true}); return; }
+          const deadlineInput=interaction.options.getString('deadline')?.trim();
+          const deadline=deadlineInput ? parseDeadline(deadlineInput) : undefined;
+          if (deadlineInput && !deadline) { await interaction.reply(withCard(interaction.commandName, {content:'Enter an ISO date or timestamp with timezone, or try today, tomorrow, next Monday, 3d, or 2w (1–9d, 1–4w).',ephemeral:true})); return; }
+          if (!status && !assignee && !deadline) { await interaction.reply(withCard(interaction.commandName, {content:'Provide at least one field to update.',ephemeral:true})); return; }
           db.prepare('UPDATE task SET status=COALESCE(?,status),assignee=COALESCE(?,assignee),deadline=COALESCE(?,deadline) WHERE id=?').run(status,assignee,deadline,task.id);
-          await interaction.reply({content:`Updated **${label}**.`,ephemeral:true});
+          await interaction.reply(withCard(interaction.commandName, {content:`Updated **${label}**.${deadline ? ` Deadline: ${deadline}.` : ''}${notificationHint('TASK_CHANNEL_ID')}`,ephemeral:true}));
           await notifyTask(`Task **${label}** updated: ${[status&&`status ${status}`,assignee&&`assignee ${assignee}`,deadline&&`deadline ${deadline}`].filter(Boolean).join(', ')}.`);
         }
         db.prepare('INSERT INTO event(source,message) VALUES(?,?)').run('task',`${action} ${label} by ${interaction.user.id}`);
@@ -601,49 +676,47 @@ client.on('interactionCreate', async interaction => {
         const title=interaction.options.getString('title',true).trim();
         const body=interaction.options.getString('description',true);
         const row=db.prepare('INSERT INTO note(title,body) VALUES(?,?)').run(title,body);
-        await interaction.reply({content:`Created note **n${Number(row.lastInsertRowid)-1}** · ${title}.`,ephemeral:true});
+        await interaction.reply(withCard(interaction.commandName, {content:`Created note **n${Number(row.lastInsertRowid)-1}** · ${title}.`,ephemeral:true}));
       } else if(action==='list'){
         const rows=db.prepare('SELECT id,title,body FROM note ORDER BY id DESC LIMIT 30').all() as Array<{id:number;title:string;body:string}>;
-        const text=rows.length?rows.map(n=>`**n${n.id-1}** · ${n.title} · ${n.body.replace(/\s+/g,' ').slice(0,50)}`).join('\n'):'No notes.';
-        await interaction.reply({content:text.slice(0,1900),ephemeral:true});
+        await interaction.reply({ ...card('Notes', rows.length ? `Showing ${rows.length} recent notes (up to 30). Use /note export to read a full note.` : 'No notes. Add one with /note add.', 'info', rows.map(n => ({ name: `n${n.id-1} • ${n.title}`, value: shorten(n.body.replace(/\s+/g,' '), 160) }))), ephemeral: true });
       } else if(action==='search'){
         const query=interaction.options.getString('query',true).trim();
         const byId=getNote(query);
         const rows=byId?[byId]:db.prepare("SELECT id,title,body FROM note WHERE title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 20").all(`%${query.replace(/[\\%_]/g,'\\$&')}%`,`%${query.replace(/[\\%_]/g,'\\$&')}%`) as Array<{id:number;title:string;body:string}>;
-        const text=rows.length?rows.map(n=>`**n${n.id-1}** · ${n.title} · ${n.body.replace(/\s+/g,' ').slice(0,80)}`).join('\n'):'No matching notes.';
-        await interaction.reply({content:text.slice(0,1900),ephemeral:true});
+        await interaction.reply({ ...card('Note search', rows.length ? `Showing ${rows.length} matches (up to 20). Use /note export to read a full note.` : 'No matching notes. Try a different keyword or note ID.', 'info', rows.map(n => ({ name: `n${n.id-1} • ${n.title}`, value: shorten(n.body.replace(/\s+/g,' '), 240) }))), ephemeral: true });
       } else if(action==='remove' || action==='export'){
         const id=interaction.options.getString('id',true);
         const note=getNote(id);
-        if(!note){await interaction.reply({content:`Note **${id}** was not found.`,ephemeral:true});return;}
+        if(!note){await interaction.reply(withCard(interaction.commandName, {content:`Note **${id}** was not found.`,ephemeral:true}));return;}
         if(action==='remove'){
           db.prepare('DELETE FROM note WHERE id=?').run(note.id);
-          await interaction.reply({content:`Removed **n${note.id-1}** · ${note.title}.`,ephemeral:true});
+          await interaction.reply(withCard(interaction.commandName, {content:`Removed **n${note.id-1}** · ${note.title}.`,ephemeral:true}));
         }else{
-          await interaction.reply({files:[new AttachmentBuilder(Buffer.from(`${note.title}\n\n${note.body}\n`),{name:`${note.title.replace(/[^a-z0-9_-]/gi,'_').slice(0,60)||'note'}.txt`})],ephemeral:true});
+          await interaction.reply(withCard(interaction.commandName, {files:[new AttachmentBuilder(Buffer.from(`${note.title}\n\n${note.body}\n`),{name:`${note.title.replace(/[^a-z0-9_-]/gi,'_').slice(0,60)||'note'}.txt`})],ephemeral:true}));
         }
       } else if(action==='exportall'){
         const notes=db.prepare('SELECT id,title,body FROM note ORDER BY id').all() as Array<{id:number;title:string;body:string}>;
-        if(!notes.length){await interaction.reply({content:'No notes to export.',ephemeral:true});return;}
+        if(!notes.length){await interaction.reply(withCard(interaction.commandName, {content:'No notes to export.',ephemeral:true}));return;}
         const content=notes.map(n=>`# n${n.id-1} · ${n.title}\n\n${n.body}`).join('\n\n---\n\n');
-        await interaction.reply({files:[new AttachmentBuilder(Buffer.from(content),{name:'sanwan-notes.txt'})],ephemeral:true});
+        await interaction.reply(withCard(interaction.commandName, {files:[new AttachmentBuilder(Buffer.from(content),{name:'sanwan-notes.txt'})],ephemeral:true}));
       } else if(action==='push'){
         const items=interaction.options.getString('text',true).split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-        if(!items.length){await interaction.reply({content:'Enter at least one non-empty inbox item.',ephemeral:true});return;}
+        if(!items.length){await interaction.reply(withCard(interaction.commandName, {content:'Enter at least one non-empty inbox item.',ephemeral:true}));return;}
         const insert=db.prepare('INSERT INTO inbox(user_id,body) VALUES(?,?)');
         const transaction=db.transaction((values:string[])=>values.forEach(v=>insert.run(interaction.user.id,v)));
         transaction(items);
-        await interaction.reply({content:`Added ${items.length} item${items.length===1?'':'s'} to your inbox.`,ephemeral:true});
+        await interaction.reply(withCard(interaction.commandName, {content:`Added ${items.length} item${items.length===1?'':'s'} to your inbox.`,ephemeral:true}));
       } else if(action==='pop'){
         const item=db.prepare('SELECT id,body FROM inbox WHERE user_id=? ORDER BY id LIMIT 1').get(interaction.user.id) as {id:number;body:string}|undefined;
-        if(!item){await interaction.reply({content:'Your inbox is empty.',ephemeral:true});return;}
+        if(!item){await interaction.reply(withCard(interaction.commandName, {content:'Your inbox is empty.',ephemeral:true}));return;}
         db.prepare('DELETE FROM inbox WHERE id=?').run(item.id);
-        await interaction.reply({content:item.body.slice(0,1900),ephemeral:true});
+        await interaction.reply({ ...card('Inbox item', item.body), ephemeral: true });
       }
     } else if(interaction.commandName==='schedule'){
       const action=interaction.options.getSubcommand();
       if((action==='set'||action==='ontrigger'||action==='unset')&&!authorized(interaction)){
-        await interaction.reply({content:'Only the server owner or an authorized role can change schedules.',ephemeral:true});return;
+        await interaction.reply(withCard(interaction.commandName, {content:'Only the server owner or an authorized role can change schedules.',ephemeral:true}));return;
       }
       const findSchedule=(value:string)=>{
         const match=/^s(\d+)$/i.exec(value.trim());
@@ -654,63 +727,70 @@ client.on('interactionCreate', async interaction => {
         const input=interaction.options.getString('name',true).trim();
         const trigger=interaction.options.getString('trigger',true) as GitHubTriggerName;
         const actionName=interaction.options.getString('action',true);
+        const repositories=(process.env.GITHUB_REPOSITORIES??'').split(',').map(value=>value.trim()).filter(Boolean);
+        if(!process.env.GITHUB_TOKEN||!repositories.length) throw new SetupGuidanceError('schedule', 'GitHub event schedules need GitHub polling configured before they can trigger.', [...(!process.env.GITHUB_TOKEN?['GITHUB_TOKEN']:[]), ...(!repositories.length?['GITHUB_REPOSITORIES']:[])], '.env', [
+          'Add at least one allowed `owner/repository`. Then retry `/schedule ontrigger`.'
+        ]);
+          const missingChannel=notificationChannelForAction(actionName);
         const byId=/^s(\d+)$/i.exec(input);
         const now=new Date().toISOString();
         if(byId){
           const existing=findSchedule(input);
-          if(!existing){await interaction.reply({content:`Schedule **${input}** was not found.`,ephemeral:true});return;}
+          if(!existing){await interaction.reply(withCard(interaction.commandName, {content:`Schedule **${input}** was not found.`,ephemeral:true}));return;}
           db.prepare("UPDATE schedule SET interval_seconds=0,action=?,next_run='',updated_at=?,trigger=? WHERE id=?").run(actionName,now,trigger,existing.id);
-          await interaction.reply({content:`Updated **s${existing.id-1} · ${existing.name}** to trigger **${trigger}** → ${actionName}.`,ephemeral:true});
+          await interaction.reply(withCard(interaction.commandName, {content:`Updated **s${existing.id-1} · ${existing.name}** to trigger **${trigger}** → ${actionName}.${missingChannel ? ` Notifications are unavailable; set ${missingChannel} in .env and restart SANWAN.` : ''}`,ephemeral:true}));
         }else{
-          if(!/^[a-z0-9][a-z0-9_-]{0,79}$/i.test(input)){await interaction.reply({content:'Use a schedule name containing letters, numbers, hyphens, or underscores.',ephemeral:true});return;}
+          if(!/^[a-z0-9][a-z0-9_-]{0,79}$/i.test(input)){await interaction.reply(withCard(interaction.commandName, {content:'Use a schedule name containing letters, numbers, hyphens, or underscores.',ephemeral:true}));return;}
           const name=input.toLowerCase();
           db.prepare(`INSERT INTO schedule(name,interval_seconds,action,next_run,updated_at,trigger) VALUES(?,0,?,'',?,?)
             ON CONFLICT(name) DO UPDATE SET interval_seconds=0,action=excluded.action,next_run='',updated_at=excluded.updated_at,trigger=excluded.trigger`)
             .run(name,actionName,now,trigger);
           const saved=findSchedule(name)!;
-          await interaction.reply({content:`Saved **s${saved.id-1} · ${saved.name}** · on **${trigger}** → ${actionName}.`,ephemeral:true});
+          await interaction.reply(withCard(interaction.commandName, {content:`Saved **s${saved.id-1} · ${saved.name}** · on **${trigger}** → ${actionName}.${missingChannel ? ` Notifications are unavailable; set ${missingChannel} in .env and restart SANWAN.` : ''}`,ephemeral:true}));
         }
       }else if(action==='set'){
         const input=interaction.options.getString('name',true).trim();
         const actionName=interaction.options.getString('action',true);
         const seconds=interaction.options.getInteger('every_seconds',true);
+        const repositories=(process.env.GITHUB_REPOSITORIES??'').split(',').map(value=>value.trim()).filter(Boolean);
+        if(actionName==='github.poll'&&(!process.env.GITHUB_TOKEN||!repositories.length)) throw new SetupGuidanceError('schedule', 'GitHub polling cannot run until its token and repository allowlist are configured.', [...(!process.env.GITHUB_TOKEN?['GITHUB_TOKEN']:[]), ...(!repositories.length?['GITHUB_REPOSITORIES']:[])], '.env');
         const byId=/^s(\d+)$/i.exec(input);
         if(byId){
           const existing=findSchedule(input);
-          if(!existing){await interaction.reply({content:`Schedule **${input}** was not found.`,ephemeral:true});return;}
+          if(!existing){await interaction.reply(withCard(interaction.commandName, {content:`Schedule **${input}** was not found.`,ephemeral:true}));return;}
           db.prepare("UPDATE schedule SET interval_seconds=?,action=?,next_run=?,updated_at=?,trigger='interval' WHERE id=?").run(seconds,actionName,new Date(Date.now()+seconds*1000).toISOString(),new Date().toISOString(),existing.id);
-          await interaction.reply({content:`Updated **s${existing.id-1} · ${existing.name}** to every ${seconds}s → ${actionName}.`,ephemeral:true});
+          const missingChannel=notificationChannelForAction(actionName);
+          await interaction.reply(withCard(interaction.commandName, {content:`Updated **s${existing.id-1} · ${existing.name}** to every ${seconds}s → ${actionName}.${missingChannel ? ` Notifications are unavailable; set ${missingChannel} in .env and restart SANWAN.` : ''}`,ephemeral:true}));
         }else{
-          if(!/^[a-z0-9][a-z0-9_-]{0,79}$/i.test(input)){await interaction.reply({content:'Use a schedule name containing letters, numbers, hyphens, or underscores.',ephemeral:true});return;}
+          if(!/^[a-z0-9][a-z0-9_-]{0,79}$/i.test(input)){await interaction.reply(withCard(interaction.commandName, {content:'Use a schedule name containing letters, numbers, hyphens, or underscores.',ephemeral:true}));return;}
           const name=input.toLowerCase();
           db.prepare(`INSERT INTO schedule(name,interval_seconds,action,next_run,updated_at,trigger) VALUES(?,?,?,?,?,'interval')
             ON CONFLICT(name) DO UPDATE SET interval_seconds=excluded.interval_seconds,action=excluded.action,next_run=excluded.next_run,updated_at=excluded.updated_at,trigger='interval'`)
             .run(name,seconds,actionName,new Date(Date.now()+seconds*1000).toISOString(),new Date().toISOString());
           const saved=findSchedule(name)!;
-          await interaction.reply({content:`Saved **s${saved.id-1} · ${saved.name}** · every ${seconds}s → ${actionName}.`,ephemeral:true});
+          const missingChannel=notificationChannelForAction(actionName);
+          await interaction.reply(withCard(interaction.commandName, {content:`Saved **s${saved.id-1} · ${saved.name}** · every ${seconds}s → ${actionName}.${missingChannel ? ` Notifications are unavailable; set ${missingChannel} in .env and restart SANWAN.` : ''}`,ephemeral:true}));
         }
       }else if(action==='unset'){
         const value=interaction.options.getString('name',true);
         const schedule=findSchedule(value);
-        if(!schedule){await interaction.reply({content:`Schedule **${value}** was not found.`,ephemeral:true});return;}
+        if(!schedule){await interaction.reply(withCard(interaction.commandName, {content:`Schedule **${value}** was not found.`,ephemeral:true}));return;}
         db.prepare('DELETE FROM schedule WHERE id=?').run(schedule.id);
-        await interaction.reply({content:`Removed **s${schedule.id-1} · ${schedule.name}**.`,ephemeral:true});
+        await interaction.reply(withCard(interaction.commandName, {content:`Removed **s${schedule.id-1} · ${schedule.name}**.`,ephemeral:true}));
       }else if(action==='list'){
         const rows=db.prepare('SELECT id,name,interval_seconds,action,next_run,trigger FROM schedule ORDER BY id').all() as Array<{id:number;name:string;interval_seconds:number;action:string;next_run:string;trigger:string}>;
-        const text=rows.length?rows.map(s=>s.trigger==='interval'?`**s${s.id-1} · ${s.name}** · every ${s.interval_seconds}s → ${s.action} · next ${s.next_run}`:`**s${s.id-1} · ${s.name}** · on ${s.trigger} → ${s.action}`).join('\n'):'No schedules.';
-        await interaction.reply({content:text.slice(0,1900),ephemeral:true});
+        await interaction.reply({ ...card('Schedules', rows.length ? `${rows.length} configured schedules.` : 'No schedules. Use /schedule set or /schedule ontrigger.', 'info', rows.map(s => ({ name: `s${s.id-1} • ${s.name}`, value: `Action: ${s.action}\n${s.trigger === 'interval' ? `Every ${s.interval_seconds}s\nNext: ${s.next_run}` : `Trigger: ${s.trigger}`}` }))), ephemeral: true });
       }else if(action==='history'){
         const rows=db.prepare('SELECT name,action,status,detail,created_at FROM schedule_history ORDER BY id DESC LIMIT 15').all() as Array<{name:string;action:string;status:string;detail:string;created_at:string}>;
-        const text=rows.length?rows.map(r=>`**${r.name}** · ${r.action} · ${r.status} · ${r.created_at} · ${r.detail}`).join('\n'):'No schedule history.';
-        await interaction.reply({content:text.slice(0,1900),ephemeral:true});
+        await interaction.reply({ ...card('Schedule history', rows.length ? 'Recent runs (up to 15).' : 'No schedule history yet.', 'info', rows.map(r => ({ name: r.name, value: `Status: **${r.status}**\nAction: ${r.action}\nTime: ${r.created_at}\n${r.detail}` }))), ephemeral: true });
       }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     log('ERROR', `${interaction.commandName} failed: ${message}`);
-    const response = 'SANWAN encountered an error. Check the local log for details.';
+    const response = commandErrorCard(interaction.commandName, error, 'SANWAN encountered an error. Check the redacted local logs.');
     if (interaction.deferred || interaction.replied) await interaction.editReply(response).catch(() => undefined);
-    else await interaction.reply({ content: response, ephemeral: true }).catch(() => undefined);
+    else await interaction.reply({ ...response, ephemeral: true }).catch(() => undefined);
     const channelId = process.env.ERROR_CHANNEL_ID;
     if (channelId) {
       try {
@@ -725,30 +805,30 @@ client.on('interactionCreate', async interaction=>{
   if(!interaction.isChatInputCommand()||!['logs','errors','status','ask'].includes(interaction.commandName)) return;
   if(interaction.replied||interaction.deferred) return;
   try{
-    if(!interaction.inGuild()||interaction.guildId!==process.env.DISCORD_GUILD_ID){await interaction.reply({content:'This SANWAN installation is restricted to its configured Discord server.',ephemeral:true});return;}
+    if(!interaction.inGuild()||interaction.guildId!==process.env.DISCORD_GUILD_ID){await interaction.reply(withCard(interaction.commandName, {content:'This SANWAN installation is restricted to its configured Discord server.',ephemeral:true}));return;}
     if(interaction.commandName==='logs'||interaction.commandName==='errors'){
-      if(!authorized(interaction)){await interaction.reply({content:'Only the server owner or an authorized role can view operational logs.',ephemeral:true});return;}
+      if(!authorized(interaction)){await interaction.reply(withCard(interaction.commandName, {content:'Only the server owner or an authorized role can view operational logs.',ephemeral:true}));return;}
       const isError=interaction.commandName==='errors';
       if(!isError&&interaction.options.getSubcommand()==='list'){
         const sources=readdirSync(logDir,{withFileTypes:true}).filter(entry=>entry.isFile()&&/^[a-z0-9][a-z0-9_-]{0,39}\.log$/i.test(entry.name)).map(entry=>entry.name.slice(0,-4));
-        await interaction.reply({content:`Available sources: ${sources.length?sources.map(name=>`**${name}**`).join(', '):'none yet'}. Worker output is available through \`docker compose logs worker\`.`,ephemeral:true});return;
+        await interaction.reply(withCard(interaction.commandName, {content:`Available sources: ${sources.length?sources.map(name=>`**${name}**`).join(', '):'none yet'}. Worker output is available through \`docker compose logs worker\`.`,ephemeral:true}));return;
       }
       const source=interaction.options.getString('name')?.trim()||'sanwan';
-      if(!/^[a-z0-9][a-z0-9_-]{0,39}$/i.test(source)){await interaction.reply({content:'Log source names may contain only letters, numbers, underscores, and hyphens.',ephemeral:true});return;}
+      if(!/^[a-z0-9][a-z0-9_-]{0,39}$/i.test(source)){await interaction.reply(withCard(interaction.commandName, {content:'Log source names may contain only letters, numbers, underscores, and hyphens.',ephemeral:true}));return;}
       const count=interaction.options.getInteger('lines')??20;
       const file=join(logDir,`${source}.log`);
-      if(!existsSync(file)){await interaction.reply({content:`No log file exists for source **${source}**. Use /logs list to see available sources.`,ephemeral:true});return;}
+      if(!existsSync(file)){await interaction.reply(withCard(interaction.commandName, {content:`No log file exists for source **${source}**. Use /logs list to see available sources.`,ephemeral:true}));return;}
       let lines=readFileSync(file,'utf8').split(/\r?\n/).filter(Boolean);
       if(isError) lines=lines.filter(line=>/\bERROR\b/.test(line));
       const text=lines.slice(-count).join('\n');
-      const block=text?['```text',text.slice(-1700),'```'].join('\n'):'No matching log lines.';
-      await interaction.reply({content:`**${source} ${isError?'errors':'logs'} · last ${count} lines**\n${block}`,ephemeral:true,allowedMentions:{parse:[]}});
+      const block=text?['```text',shorten(text.replace(/```/g, 'ˋˋˋ'), 3000),'```'].join('\n'):'No matching log lines.';
+      await interaction.reply(withCard(interaction.commandName, {content:`**${source} ${isError?'errors':'logs'} · last ${count} lines**\n${block}`,ephemeral:true,allowedMentions:{parse:[]}}));
     }else if(interaction.commandName==='status'){
       const action=interaction.options.getSubcommand();
       if(action==='disks'){
         const fsInfo=statfsSync(dataDir);
         const total=Number(fsInfo.blocks)*Number(fsInfo.bsize);const free=Number(fsInfo.bavail)*Number(fsInfo.bsize);
-        await interaction.reply({content:`SANWAN data volume · ${(free/1024**3).toFixed(2)} GiB free of ${(total/1024**3).toFixed(2)} GiB.`,ephemeral:true});
+        await interaction.reply({ ...card('Data volume', '', 'info', [{ name: 'Free', value: `${(free/1024**3).toFixed(2)} GiB`, inline: true }, { name: 'Total', value: `${(total/1024**3).toFixed(2)} GiB`, inline: true }]), ephemeral: true });
       }else if(action==='resources'){
         const memory=process.memoryUsage();
         const limits=readContainerLimits();
@@ -756,45 +836,45 @@ client.on('interactionCreate', async interaction=>{
           ?`Container memory ${(limits.memoryUsageBytes/1024**2).toFixed(1)} MiB used of ${(limits.memoryLimitBytes/1024**2).toFixed(1)} MiB`
           :`Host memory ${(os.freemem()/1024**3).toFixed(2)} GiB free of ${(os.totalmem()/1024**3).toFixed(2)} GiB`;
         const cpu=limits.cpuQuotaCores?`Container CPU quota ${limits.cpuQuotaCores.toFixed(2)} cores`:`${os.cpus().length} logical CPUs`;
-        await interaction.reply({content:`SANWAN process · Node ${process.version} · ${process.platform}/${process.arch}\nProcess RSS ${(memory.rss/1024**2).toFixed(1)} MiB · heap ${(memory.heapUsed/1024**2).toFixed(1)} MiB\n${availableMemory} · ${cpu} · load ${os.loadavg().map(v=>v.toFixed(2)).join('/')}`,ephemeral:true});
+        await interaction.reply({ ...card('System resources', '', 'info', [{ name: 'Runtime', value: `Node ${process.version} • ${process.platform}/${process.arch}` }, { name: 'Process memory', value: `RSS: ${(memory.rss/1024**2).toFixed(1)} MiB\nHeap: ${(memory.heapUsed/1024**2).toFixed(1)} MiB` }, { name: 'Available memory', value: availableMemory }, { name: 'CPU', value: `${cpu}\nLoad: ${os.loadavg().map(v=>v.toFixed(2)).join('/')}` }]), ephemeral: true });
       }else{
         let github='not configured';
         if(process.env.GITHUB_TOKEN){try{const response=await fetch('https://api.github.com',{headers:{Authorization:`Bearer ${process.env.GITHUB_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(5000)});github=`reachable (HTTP ${response.status})`;}catch{github='unreachable';}}
-        await interaction.reply({content:`Discord Gateway · ${client.isReady()?'connected':'disconnected'} (${client.ws.ping} ms)\nGitHub API · ${github}`,ephemeral:true});
+        await interaction.reply({ ...card('Network connectivity', '', client.isReady() && !github.includes('unreachable') ? 'info' : 'warning', [{ name: 'Discord Gateway', value: `${client.isReady()?'Connected':'Disconnected'}\nLatency: ${latencyLabel(client.ws.ping)}`, inline: true }, { name: 'GitHub API', value: github, inline: true }]), ephemeral: true });
       }
     }else if(interaction.commandName==='ask'){
       const action=interaction.options.getSubcommand();
       if(action==='config'){
         const config=askConfig();const endpoint=new URL(config.base);
-        await interaction.reply({content:`Provider: **${config.provider}**\nModel: **${config.model}**\nEndpoint: **${endpoint.origin}${endpoint.pathname}**`,ephemeral:true});
+        await interaction.reply({ ...card('AI configuration', '', 'info', [{ name: 'Provider', value: config.provider, inline: true }, { name: 'Model', value: config.model, inline: true }, { name: 'Endpoint', value: `${endpoint.origin}${endpoint.pathname}` }]), ephemeral: true });
       }else if(action==='models'){
         await interaction.deferReply({ephemeral:true});
         const models=await askModels();
-        await interaction.editReply(models.length?`Models · ${models.slice(0,25).join(', ')}`:'Provider returned no models.');
+        await interaction.editReply(card('AI models', models.length ? models.join('\n') : 'Provider returned no models. Check the provider configuration.'));
       }else if(action==='switch'){
-        if(!authorized(interaction)){await interaction.reply({content:'Only the server owner or an authorized role can switch the AI model.',ephemeral:true});return;}
+        if(!authorized(interaction)){await interaction.reply(withCard(interaction.commandName, {content:'Only the server owner or an authorized role can switch the AI model.',ephemeral:true}));return;}
         const model=interaction.options.getString('model',true).trim();
         const models=await askModels();
-        if(!models.includes(model)){await interaction.reply({content:'That model is not available from the configured provider.',ephemeral:true});return;}
+        if(!models.includes(model)){await interaction.reply(withCard(interaction.commandName, {content:'That model is not available from the configured provider.',ephemeral:true}));return;}
         db.prepare("INSERT INTO setting(key,value) VALUES('ask_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(model);
-        await interaction.reply({content:`Active AI model set to **${model}**.`,ephemeral:true});
+        await interaction.reply(withCard(interaction.commandName, {content:`Active AI model set to **${model}**.`,ephemeral:true}));
       }else{
         const userId=interaction.user.id;const now=Date.now();
-        if(now-(askLastRequest.get(userId)??0)<10_000){await interaction.reply({content:'Please wait 10 seconds between AI requests.',ephemeral:true});return;}
-        if(askRequestsInFlight>=2){await interaction.reply({content:'SANWAN is handling its maximum number of AI requests. Try again shortly.',ephemeral:true});return;}
+        if(now-(askLastRequest.get(userId)??0)<10_000){await interaction.reply(withCard(interaction.commandName, {content:'Please wait 10 seconds between AI requests.',ephemeral:true}));return;}
+        if(askRequestsInFlight>=2){await interaction.reply(withCard(interaction.commandName, {content:'SANWAN is handling its maximum number of AI requests. Try again shortly.',ephemeral:true}));return;}
         askLastRequest.set(userId,now);askRequestsInFlight++;
         await interaction.deferReply({ephemeral:true});
         try{
           const result=await askProvider(interaction.options.getString('text',true));
-          await interaction.editReply({content:`**${result.model}**\n${result.answer.slice(0,1800)}`,allowedMentions:{parse:[]}});
+          await interaction.editReply(card('AI response', result.answer, 'info', [{ name: 'Model', value: result.model }]));
         }finally{askRequestsInFlight--;}
       }
     }
   }catch(error){
     log('ERROR',`${interaction.commandName} failed: ${error instanceof Error?error.message:'Unknown error'}`);
-    const safe='SANWAN could not complete that request. Check the redacted logs.';
+    const safe=commandErrorCard(interaction.commandName,error);
     if(interaction.deferred||interaction.replied) await interaction.editReply(safe).catch(()=>undefined);
-    else await interaction.reply({content:safe,ephemeral:true}).catch(()=>undefined);
+    else await interaction.reply({ ...safe, ephemeral:true }).catch(()=>undefined);
     await postChannel(process.env.ERROR_CHANNEL_ID,'SANWAN status, logs, or AI request failed. See local redacted logs.');
   }
 });

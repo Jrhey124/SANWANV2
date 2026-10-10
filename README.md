@@ -7,12 +7,32 @@ SANWAN is a self-hosted Discord bot for GitHub Actions monitoring and Docker Com
 Prerequisites: Docker Engine with Compose v2, Node.js 22+ for setup, a Discord bot, and a configured GitHub token if using CI.
 
 1. Invite the bot to your server using the `bot` and `applications.commands` OAuth scopes.
-2. Run `node setup.js` in an interactive terminal on the host (PowerShell works with Docker Desktop). It detects the host profile and Docker capabilities, reads credentials without echoing them, checks the Compose configuration, generates `SQLITE_KEY` and `WORKER_TOKEN`, and creates local config folders. At the end, accept the prompt to build and start SANWAN in Docker.
+2. Run `node setup.js` in an interactive terminal on the host (PowerShell works with Docker Desktop). The four-step wizard asks for Discord credentials first, then lets you configure GitHub, AI, or advanced settings now or on a later run. It hides secret input, checks Docker and Compose, generates `SQLITE_KEY` and `WORKER_TOKEN`, and creates local config folders. At the end, accept the prompt to build and start SANWAN in Docker. If Docker Desktop is not running, setup still saves `.env` and shows the launch command.
 3. If you skip the setup launch prompt, start it later with `docker compose up -d --build`, then try `/ping`.
 
 Slash commands are registered to the configured Discord server on startup, so they become available there without waiting for global command propagation.
 
 The bot container runs as an unprivileged user without a Docker socket, drops Linux capabilities, and has a read-only root filesystem. Its Docker healthcheck tracks a short-lived heartbeat written only while the Discord client is ready. Its encrypted SQLite database and logs use Docker-managed volumes. Setup gives `.env` owner-only permissions on Linux; keep it and backups protected.
+
+## Configure and test GitHub monitoring
+
+Run `node setup.js` and choose **2) GitHub monitoring** under optional features. Enter a GitHub token, a comma-separated repository allowlist such as `Jrhey124/Sanwan`, and the Discord channel ID for GitHub notifications. If a value is already configured, setup lets you keep or replace it. The token input is hidden.
+
+SANWAN polls GitHub Actions workflow runs and repository activity for each allowed repository once per minute, respecting a longer activity polling interval if GitHub requests one. /ci status also refreshes activity for the selected repository before listing workflow runs. It reports workflow state changes, pushes to branches (even without workflows), and branch creation or deletion. Activity messages include the repository, actor, branch, and a relevant GitHub link; push messages also include the commit. Each repository's first successful activity poll establishes a saved baseline without announcing historical activity. Workflow monitoring also records its initial baseline silently. Saved event IDs prevent repeated activity notifications after restarts; failed channel delivery is retried while the event remains in GitHub's feed.
+
+To test activity monitoring, finish setup and accept its build/start prompt. Run /ci status for the allowlisted repository to request an activity refresh, then push a new commit, create a branch, or delete a test branch and run /ci status again. The response says whether it checked, is already checking, or is waiting for GitHub's allowed polling interval. These notifications require the GitHub notification channel and the bot's permission to send messages there. No workflow is required. If no channel is configured, observed events are recorded silently and are not replayed when a channel is added later.
+
+For workflow monitoring, enable GitHub Actions and trigger a new workflow run after SANWAN's baseline poll. `/ci status` shows recent workflow runs; **No workflow runs found** means GitHub returned no Actions runs, even if push or branch monitoring works. `/schedule ontrigger` continues to support workflow completion events, with notifications routed to the GitHub or error channel.
+
+The fine-grained token must have access to the allowlisted repositories, with **Metadata: read** for activity and **Actions: read** for workflow runs. GitHub's [repository events API](https://docs.github.com/en/rest/activity/events#list-repository-events) can delay activity by 30 seconds to 6 hours and exposes at most 300 events from the past 30 days. SANWAN checks up to three pages of activity and the latest 10 workflow runs per repository. Activity outside that window can be missed during long downtime or heavy traffic. Tag events are not announced. Monitoring uses outbound HTTPS; no webhook endpoint is needed.
+
+## Check setup connectivity
+
+After setup builds and starts SANWAN, choose **Run checks** to run read-only diagnostics inside the bot container. To check again later, run `node setup.js` and choose **Check saved setup** when the existing configuration is detected. Checks-only mode does not rewrite configuration or generate new secrets. The checks use the running container's settings; rebuild through setup after changing configuration.
+
+Results use **PASS**, **WARN**, **FAIL**, and **SKIP** with explanations and next steps. The checks cover Docker health and the Discord heartbeat, bot identity, server access, registered commands, notification-channel permissions, GitHub repository/workflow/activity access, the saved active AI model, and the enabled worker's health and service registry. Empty workflow or activity feeds count as successful access. Unconfigured optional integrations are skipped. Container startup waiting is limited to 60 seconds and network requests to 15 seconds each; failures do not undo setup or stop other checks.
+
+These checks do not send Discord messages, create branches, generate AI responses, or deploy services. A listed AI model does not prove quota or billing availability. Permission checks do not prove message delivery, and a working activity endpoint does not prove that GitHub has published a particular event. Test those behaviors using normal Discord commands and a fresh repository event after the initial monitoring baseline.
 
 ## Configure services and deployments
 

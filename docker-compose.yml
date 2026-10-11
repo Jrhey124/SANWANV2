@@ -12,6 +12,7 @@ services:
       DATA_DIR: /app/data
       LOG_DIR: /app/logs
       SERVICES_CONFIG: /config/services.json
+      DEPLOYMENTS_ENABLED: "false"
       WORKER_URL: ${WORKER_URL:-http://worker:8877}
     volumes:
       - sanwan-data:/app/data

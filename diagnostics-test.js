@@ -70,5 +70,27 @@ module.exports=async temp=>{
   await runSavedChecks({run:mockRun,now:()=>time,sleep:async ms=>{time+=ms;},print:x=>output.push(x)});
   assert.equal(time,60000,'startup waiting must stop at 60 seconds');
   assert.match(output.join('\n'),/Fixture: Checks ran/);
+  const registeredPath=path.join(temp,'registered-services.json');
+  fs.writeFileSync(registeredPath,JSON.stringify({services:{demo:{github_repository:'acme/app',workflow_name:'Publish',staging_branch:'develop',production_branch:'main',image_repository:'ghcr.io/acme/app',environments:{staging:{compose_file:'demo/staging.json',compose_project:'demo-staging',compose_service:'app'},production:{compose_file:'demo/production.json',compose_project:'demo-production',compose_service:'app'}}}}}));
+  const registeredEnv={...env,SERVICES_CONFIG:registeredPath,DEPLOYMENTS_ENABLED:'true',WORKER_TOKEN:'private-worker-value',GHCR_USERNAME:'acme',GHCR_TOKEN:'private-package-value'};
+  const simulations=[];
+  const readinessRequest=async(url,options)=>{
+    if(url.includes('ghcr.io/token'))return new Response(JSON.stringify({token:'ephemeral-private-value'}));
+    if(url.includes('/tags/list'))return new Response(JSON.stringify({tags:[]}));
+    if(url.endsWith('/v1/action')){
+      const body=JSON.parse(options.body);assert.equal(body.operation,'simulate');assert.equal(options.method,'POST');assert.ok(options.signal);
+      assert.equal(options.headers.Authorization,'Bearer '+registeredEnv.WORKER_TOKEN);simulations.push(body);
+      return new Response(JSON.stringify({ok:true,changed:false}));
+    }
+    return request(url,options);
+  };
+  const ready=await runDiagnostics(registeredEnv,readinessRequest,false,()=>env.ASK_MODEL);
+  assert.equal(ready.find(r=>r.name==='GHCR ghcr.io/acme/app').status,'PASS','empty registry metadata is accessible');
+  assert.equal(ready.filter(r=>r.name.startsWith('Service demo/')&&r.status==='PASS').length,2);
+  assert.deepEqual(simulations.map(s=>s.environment),['staging','production']);
+  const unhealthy=await runDiagnostics(registeredEnv,async(url,options)=>url.endsWith('/v1/action')&&JSON.parse(options.body).environment==='staging'?new Response('{}',{status:400}):readinessRequest(url,options),false,()=>env.ASK_MODEL);
+  assert.equal(unhealthy.find(r=>r.name==='Service demo/staging').status,'FAIL');
+  assert.equal(unhealthy.find(r=>r.name==='Service demo/production').status,'PASS','one service failure does not stop other checks');
+  for(const secret of [registeredEnv.WORKER_TOKEN,registeredEnv.GHCR_TOKEN,'ephemeral-private-value'])assert.ok(!JSON.stringify([ready,unhealthy]).includes(secret));
   console.log('PASS: setup diagnostics check optional integrations, respect bounds, report failures safely, and preserve saved data.');
 };

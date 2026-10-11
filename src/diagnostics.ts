@@ -5,6 +5,7 @@ import { isHealthy } from './health';
 
 type Result = {status:'PASS'|'WARN'|'FAIL'|'SKIP'; name:string; detail:string};
 export async function runDiagnostics(env:NodeJS.ProcessEnv=process.env, request:typeof fetch=fetch, workerEnabled=false, activeModel?:()=>string|undefined):Promise<Result[]> {
+  workerEnabled=workerEnabled||env.DEPLOYMENTS_ENABLED==='true';
   const results:Result[]=[];
   const add=(status:Result['status'],name:string,detail:string)=>results.push({status,name,detail});
   const check=async(name:string,action:()=>Promise<void>,fix='Check access and settings with node setup.js, then rebuild and start.')=>{
@@ -95,6 +96,29 @@ export async function runDiagnostics(env:NodeJS.ProcessEnv=process.env, request:
       const services=Object.values(registry.services) as Array<Record<string,any>>;
       const valid=services.every(s=>s.github_repository&&s.workflow_name&&s.staging_branch&&s.production_branch&&s.image_repository&&['staging','production'].every(e=>s.environments?.[e]?.compose_file&&s.environments[e].compose_project&&s.environments[e].compose_service));
       add(!services.length?'WARN':valid?'PASS':'FAIL','Service registry',!services.length?'No services registered. Configure config/services.json.':valid?'Service registry has required fields. Deployment execution is not tested.':'Missing service or environment fields; update config/services.json.');
+      if(valid)for(const image of new Set(services.map(s=>s.image_repository as string))){
+        if(!image.startsWith('ghcr.io/'))continue;
+        await check('GHCR '+image,async()=>{
+          if(!/^ghcr\.io\/[a-z0-9][a-z0-9._/-]*$/.test(image)||image.includes('..'))throw new Error('Invalid image');
+          if(env.GHCR_TOKEN&&!env.GHCR_USERNAME)throw new Error('Missing GHCR username');
+          const repository=image.slice('ghcr.io/'.length);
+          const headers:Record<string,string>=env.GHCR_TOKEN?{Authorization:'Basic '+Buffer.from(env.GHCR_USERNAME+':'+env.GHCR_TOKEN).toString('base64')}:{};
+          const access=await get('https://ghcr.io/token?service=ghcr.io&scope='+encodeURIComponent('repository:'+repository+':pull'),headers);
+          if(typeof access.token!=='string')throw new Error('Token unavailable');
+          await get('https://ghcr.io/v2/'+repository+'/tags/list',{Authorization:'Bearer '+access.token});
+          add('PASS','GHCR '+image,'Registry metadata is accessible. Image publication, pulls and deployment remain untested.');
+        },'Check the image name and package visibility. For private images, configure GHCR username and a read:packages token using node setup.js.');
+      }
+      if(valid)for(const [name,service] of Object.entries(registry.services) as Array<[string,Record<string,any>]>)for(const environment of ['staging','production']){
+        await check('Service '+name+'/'+environment,async()=>{
+          if(!env.WORKER_TOKEN)throw new Error('Worker token missing');
+          const response=await request((env.WORKER_URL??'http://worker:8877')+'/v1/action',{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+env.WORKER_TOKEN},body:JSON.stringify({operation:'simulate',service:name,environment}),signal:AbortSignal.timeout(15000)});
+          if(!response.ok)throw new Error('HTTP '+response.status);
+          const result=await response.json() as {ok?:boolean;changed?:boolean};
+          if(!result.ok||result.changed!==false)throw new Error('Invalid simulation');
+          add('PASS','Service '+name+'/'+environment,'Read-only worker validation passed: Compose and healthcheck configured. Actual deployment and application health are not tested.');
+        },'Check service paths, permissions, named volumes and healthchecks using node setup.js. An image healthcheck must be available locally; missing images are not pulled by diagnostics.');
+      }
     },'Check config/services.json for valid JSON and required service mappings.');
   }
   for(const row of results)for(const name of ['DISCORD_TOKEN','GITHUB_TOKEN','ASK_API_KEY','GHCR_TOKEN','SQLITE_KEY','WORKER_TOKEN']){

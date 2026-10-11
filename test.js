@@ -19,6 +19,7 @@ const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'sanwan-test-'));
 try {
   await require('./github-activity-test.js')(temp);
   await require('./diagnostics-test.js')(temp);
+  await require('./deployment-setup-test.js')(temp);
   const askSetup=new SetupGuidanceError('ask','AI chat is not configured yet.',['ASK_PROVIDER','ASK_BASE_URL','ASK_MODEL']);
   const askSetupEmbed=setupGuidanceCard(askSetup).embeds[0];
   assert.match(askSetupEmbed.title,/AI assistant setup/);
@@ -286,12 +287,14 @@ try {
     if(a[0]==='info') out(process.env.FAKE_DOCKER_ROOTFUL==='1'?'[]':'["name=rootless"]');
     else if(a.includes('config')) {
       const service={healthcheck:{test:['CMD','true']}};
+      if(process.env.FAKE_DOCKER_IMAGE_HEALTH){delete service.healthcheck;service.image='example.com/owner/app:latest';}
       if(process.env.FAKE_DOCKER_UNSAFE==='1') service.volumes=[{type:'bind'}];
       if(process.env.FAKE_DOCKER_INDIRECT==='1') service.volumes_from=['host-container:/'];
       if(process.env.FAKE_DOCKER_TRAVERSAL==='1') service.volumes=[{type:'volume',source:'../../host-path'}];
       out(JSON.stringify({services:{app:service}}));
     }
     else if(a[0]==='image'&&a[1]==='inspect') {
+      if(a.includes('{{json .Config.Healthcheck}}')){out(process.env.FAKE_DOCKER_IMAGE_HEALTH==='valid'?JSON.stringify({Test:['CMD','true']}):'null');process.exit(0);}
       const image=a.at(-1); const sha=image.includes(':sha-')?image.split(':sha-')[1]:(process.env.FAKE_DOCKER_EXPECTED_SHA||'a'.repeat(40));
       const hex=(sha[0]||'a').repeat(64); const label=process.env.FAKE_DOCKER_BAD_REVISION==='1'?'f'.repeat(40):sha;
       out(JSON.stringify(['example.com/owner/app@sha256:'+hex])+'|'+label);
@@ -342,6 +345,12 @@ try {
       const recovered=await handle({operation:'status',service:'app',environment:'staging'});
       assert.ok(recovered.active_digest.endsWith('b'.repeat(64)),'failed rollback keeps the current release recorded as active');
       assert.equal(fs.readFileSync(process.env.FAKE_DOCKER_ACTIVE_FILE,'utf8'),recovered.active_digest,'failed rollback restores the running current release');
+      process.env.FAKE_DOCKER_UNHEALTHY_DIGEST='example.com/owner/app@sha256:'+'c'.repeat(64);
+      await assert.rejects(handle({operation:'deploy',service:'app',environment:'staging',sha:'c'.repeat(40)}),/previous release restored/);
+      delete process.env.FAKE_DOCKER_UNHEALTHY_DIGEST;
+      const restored=await handle({operation:'status',service:'app',environment:'staging'});
+      assert.equal(restored.active_digest,recovered.active_digest,'failed deployment retains the recorded active release');
+      assert.equal(fs.readFileSync(process.env.FAKE_DOCKER_ACTIVE_FILE,'utf8'),recovered.active_digest,'failed deployment restores the running image');
       await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
       const response=await fetch('http://127.0.0.1:'+server.address().port+'/v1/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({operation:'status',service:'app',environment:'staging'})});
       assert.equal(response.status,401);
@@ -354,6 +363,13 @@ try {
   assert.equal(workerRun.status, 0, workerRun.stderr);
   process.stdout.write(workerRun.stdout);
 
+  for(const imageHealth of ['valid','missing']){
+    const healthRun=runWorkerTest({...workerEnv,FAKE_DOCKER_IMAGE_HEALTH:imageHealth},`const assert=require('node:assert/strict');const {handle}=require('./dist/worker.js');(async()=>{const operation=handle({operation:'simulate',service:'app',environment:'staging'});if(process.env.FAKE_DOCKER_IMAGE_HEALTH==='valid')assert.equal((await operation).changed,false);else await assert.rejects(operation,/Image healthcheck is not available/);})().catch(e=>{console.error(e);process.exitCode=1;});`);
+    assert.equal(healthRun.status,0,healthRun.stderr);
+  }
+  console.log('PASS: worker accepts inherited image healthchecks and rejects missing healthchecks without pulling images.');
+  const restarted=runWorkerTest(workerEnv,`const assert=require('node:assert/strict');const {handle}=require('./dist/worker.js');handle({operation:'status',service:'app',environment:'staging'}).then(s=>{assert.ok(s.active_digest.endsWith('b'.repeat(64)));assert.ok(s.previous_digest.endsWith('a'.repeat(64)));console.log('PASS: restarted worker retains active and previous healthy releases.');}).catch(e=>{console.error(e);process.exitCode=1;});`);
+  assert.equal(restarted.status,0,restarted.stderr);process.stdout.write(restarted.stdout);
   const corruptState = runWorkerTest({ ...workerEnv, WORKER_STATE_DIR: path.join(workerRoot, 'corrupt-state') }, `
     const assert=require('node:assert/strict'); const fs=require('node:fs');
     fs.mkdirSync(process.env.WORKER_STATE_DIR,{recursive:true}); fs.writeFileSync(process.env.WORKER_STATE_DIR+'/releases.json','{broken');

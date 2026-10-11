@@ -120,7 +120,7 @@ function overrideFor(service:Service,environment:'staging'|'production',digest:s
   writeFileSync(path,JSON.stringify({services:{[env.compose_service]:{image:digest,pull_policy:'always'}}}),{mode:0o600,flag:'wx'});
   return path;
 }
-type RenderedService={privileged?:boolean;network_mode?:string;pid?:string;ipc?:string;uts?:string;userns_mode?:string;devices?:unknown[];cap_add?:unknown[];healthcheck?:{test?:unknown};volumes?:Array<{type?:string;source?:string}>;build?:unknown;security_opt?:string[];secrets?:unknown[];configs?:unknown[];volumes_from?:unknown[];extends?:unknown;credential_spec?:unknown;devices_cgroup_rules?:unknown[];deploy?:{privileged?:boolean;resources?:{reservations?:{devices?:unknown[]}}}};
+type RenderedService={image?:string;privileged?:boolean;network_mode?:string;pid?:string;ipc?:string;uts?:string;userns_mode?:string;devices?:unknown[];cap_add?:unknown[];healthcheck?:{test?:unknown;disable?:boolean};volumes?:Array<{type?:string;source?:string}>;build?:unknown;security_opt?:string[];secrets?:unknown[];configs?:unknown[];volumes_from?:unknown[];extends?:unknown;credential_spec?:unknown;devices_cgroup_rules?:unknown[];deploy?:{privileged?:boolean;resources?:{reservations?:{devices?:unknown[]}}}};
 async function getComposeConfig(service:Service,environment:'staging'|'production',override?:string){
   const args=baseArgs(service,environment);
   if(override) args.push('-f',override);
@@ -134,7 +134,15 @@ async function getComposeConfig(service:Service,environment:'staging'|'productio
   if(item.secrets?.length||item.configs?.length) throw new Error('Compose file secrets and configs are not allowed; manage credentials outside deployment definitions.');
   if(item.volumes_from?.length||item.extends||item.credential_spec||item.devices_cgroup_rules?.length) throw new Error('Deployment service uses an indirect mount, inherited service, host credential, or device rule.');
   if(item.build) throw new Error('Deployment definitions must use published images, not build contexts.');
-  if(!item.healthcheck?.test||JSON.stringify(item.healthcheck.test).includes('NONE')) throw new Error('Deployment service must define a working healthcheck.');
+  if(item.healthcheck?.disable)throw new Error('Deployment service must define a working healthcheck.');
+  if(item.healthcheck?.test!==undefined){
+    if(!Array.isArray(item.healthcheck.test)||item.healthcheck.test.length<2||!['CMD','CMD-SHELL'].includes(item.healthcheck.test[0]))throw new Error('Deployment service must define a working healthcheck.');
+  }else{
+    if(!item.image)throw new Error('Deployment service must use a published image.');
+    let health:{Test?:string[]}|undefined;
+    try{health=JSON.parse(await docker(['image','inspect','--format','{{json .Config.Healthcheck}}',item.image]));}catch{}
+    if(!health?.Test||health.Test.length<2||!['CMD','CMD-SHELL'].includes(health.Test[0]))throw new Error('Image healthcheck is not available locally. Add a Compose healthcheck or provide a published image with HEALTHCHECK.');
+  }
   if(item.volumes?.some(v=>v.type!=='volume'||!v.source||v.source.startsWith('/')||v.source.split(/[\\/]/).includes('..'))) throw new Error('Only named volumes are allowed; bind mounts and host paths are prohibited.');
   return config;
 }

@@ -1,14 +1,19 @@
+const fs = require('node:fs');
+const {composeArgs} = require('./setup-deployments.js');
 const { spawnSync } = require('node:child_process');
 const { findDockerCommand } = require('./docker-cli.js');
 
 async function runSavedChecks({run=spawnSync,now=Date.now,sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),print=console.log}={}) {
   const docker=findDockerCommand();
+  const values={};
+  if(fs.existsSync('.env'))for(const line of fs.readFileSync('.env','utf8').split(/\r?\n/)){const i=line.indexOf('=');if(i>0)values[line.slice(0,i)]=line.slice(i+1);}
+  const base=composeArgs(values);
   const invoke=(args,timeout=10000)=>run(docker,args,{encoding:'utf8',windowsHide:true,timeout});
   const report=(status,name,detail)=>print(`  ${status} · ${name}: ${detail}`);
   print('\nSANWAN connectivity checks (read-only)');
   const engine=invoke(['version','--format','{{.Server.Version}}']);
   if(engine.status!==0){report('FAIL','Docker','Engine unavailable. Start Docker Desktop or Docker Engine, then run node setup.js.');return;}
-  const idResult=invoke(['compose','ps','-q','sanwan']);
+  const idResult=invoke([...base,'ps','-q','sanwan']);
   const id=idResult.stdout?.trim();
   if(idResult.status!==0||!id){report('FAIL','Container','SANWAN is not running. Launch it through node setup.js.');return;}
   const deadline=now()+60000;
@@ -27,8 +32,8 @@ async function runSavedChecks({run=spawnSync,now=Date.now,sleep=ms=>new Promise(
   if(projectResult.status!==0||!project){report('FAIL','Diagnostics','Cannot determine Compose project. Retry through node setup.js.');return;}
   const workers=invoke(['ps','-a','--filter','label=com.docker.compose.project='+project,'--filter','label=com.docker.compose.service=worker','--format','{{.ID}}']);
   if(workers.status!==0){report('FAIL','Diagnostics','Cannot inspect the optional worker. Check Docker access.');return;}
-  const args=['compose','exec','-T','sanwan','node','dist/diagnostics.js'];
-  if(workers.stdout?.trim())args.push('--worker-enabled');
+  const args=[...base,'exec','-T','sanwan','node','dist/diagnostics.js'];
+  if(workers.stdout?.trim()||values.DEPLOYMENTS_ENABLED==='true')args.push('--worker-enabled');
   const result=invoke(args,600000);
   let rows;
   try{rows=JSON.parse(result.stdout);}catch{}

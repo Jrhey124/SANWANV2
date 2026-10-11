@@ -25,7 +25,7 @@ WORKDIR /app
 COPY --from=build --chown=sanwan:sanwan /app/package*.json ./
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && npm ci --omit=dev && apt-get purge -y python3 make g++ && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 COPY --from=build --chown=sanwan:sanwan /app/dist ./dist
-COPY --chown=sanwan:sanwan setup.js setup-checks.js uninstall.js docker-cli.js ./
+COPY --chown=sanwan:sanwan setup.js setup-checks.js setup-deployments.js uninstall.js docker-cli.js ./
 RUN mkdir -p /app/data /app/logs && chown sanwan:sanwan /app/data /app/logs
 USER sanwan
 VOLUME ["/app/data", "/app/logs"]

@@ -7,12 +7,12 @@ SANWAN is a self-hosted Discord bot for GitHub Actions monitoring and Docker Com
 Prerequisites: Docker Engine with Compose v2, Node.js 22+ for setup, a Discord bot, and a configured GitHub token if using CI.
 
 1. Invite the bot to your server using the `bot` and `applications.commands` OAuth scopes.
-2. Run `node setup.js` in an interactive terminal on the host (PowerShell works with Docker Desktop). The four-step wizard asks for Discord credentials first, then lets you configure GitHub, AI, or advanced settings now or on a later run. It hides secret input, checks Docker and Compose, generates `SQLITE_KEY` and `WORKER_TOKEN`, and creates local config folders. At the end, accept the prompt to build and start SANWAN in Docker. If Docker Desktop is not running, setup still saves `.env` and shows the launch command.
+2. Run `node setup.js` in an interactive terminal on the host (PowerShell works with Docker Desktop). The four-step wizard asks for Discord credentials first, then lets you configure GitHub, AI, advanced settings, or application deployments now or on a later run. It hides secret input, checks Docker and Compose, generates `SQLITE_KEY` and `WORKER_TOKEN`, and creates local config folders. At the end, accept the prompt to build and start SANWAN in Docker. If Docker Desktop is not running, setup still saves `.env` and shows the launch command.
 3. If you skip the setup launch prompt, start it later with `docker compose up -d --build`, then try `/ping`.
 
 Slash commands are registered to the configured Discord server on startup, so they become available there without waiting for global command propagation.
 
-The bot container runs as an unprivileged user without a Docker socket, drops Linux capabilities, and has a read-only root filesystem. Its Docker healthcheck tracks a short-lived heartbeat written only while the Discord client is ready. Its encrypted SQLite database and logs use Docker-managed volumes. Setup gives `.env` owner-only permissions on Linux; keep it and backups protected.
+The bot container runs as an unprivileged user without a Docker socket, drops Linux capabilities, and has a read-only root filesystem. Its Docker healthcheck tracks a short-lived heartbeat written only while the Discord client is ready. Its encrypted SQLite database and logs use Docker-managed volumes. Setup makes the non-secret service registry container-readable and managed directories searchable, repairing older setup permissions. It gives `.env` owner-only permissions on Linux; keep it and backups protected.
 
 ## Configure and test GitHub monitoring
 
@@ -40,7 +40,7 @@ The deployment worker is separate and stays off unless explicitly enabled. On th
 
 Copy `templates/service-workflow.yml` to the target application's `.github/workflows/`. Adapt its test and build steps. It publishes `ghcr.io/<owner>/<repo>:sha-<commit>` with the source revision label used by the worker. Set the configured workflow name and staging/production branches to match the workflow and repository.
 
-The worker requires a **rootless Docker daemon** and its Unix socket. It checks the daemon before opening its HTTP API and refuses to start against a rootful engine. Set `DOCKER_SOCKET_PATH` and `DOCKER_SOCKET_GID` in `.env` to that daemon's socket and group, then enable the worker profile:
+The worker requires a **rootless Docker daemon** and its Unix socket. It checks the daemon before opening its HTTP API and refuses to start against a rootful engine. Configure this through `node setup.js`. It detects the selected daemon socket and uses the container-visible socket group (normally 0 for the rootless daemon owner). If launching manually after setup, enable the worker profile:
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.worker.yml --profile deployment up -d --build
@@ -48,7 +48,7 @@ docker compose -f docker-compose.yml -f docker-compose.worker.yml --profile depl
 
 The worker is on an internal Compose network and is the only container with the Docker socket. Do not enable it against a rootful daemon. Private GHCR images need a separate read-only package token in `GHCR_TOKEN` and its account name in `GHCR_USERNAME`; never use a write-scoped token.
 
-The first successful post-start push to a configured staging branch deploys automatically. `/deploy release` deploys an exact successful staging commit or requests production approval. Production requests expire after 24 hours, require a different authorized user to approve, and are checked again against the latest successful production workflow before the worker acts. The production request resolves and displays the immutable image digest before approval; the worker deploys that exact digest. Production rollbacks also require another authorized approver and are bound to the exact previous digest. The worker checks health and restores the prior healthy digest if a release fails.
+Each repository establishes a silent initial workflow baseline. After that, only the newest matching successful push run for each service and branch is considered for automatic staging deployment. Persisted release cursors prevent older responses from moving staging backwards; failed releases have at most three attempts. Production approvals are superseded only after revalidating a newer successful matching release. `/deploy release` deploys an exact successful staging commit or requests production approval. Production requests expire after 24 hours, require a different authorized user to approve, and are checked again against the latest successful production workflow before the worker acts. The production request resolves and displays the immutable image digest before approval; the worker deploys that exact digest. Production rollbacks also require another authorized approver and are bound to the exact previous digest. The worker checks health and restores the prior healthy digest if a release fails.
 
 ## Discord commands
 

@@ -1,6 +1,7 @@
 services:
   sanwan:
     environment:
+      DEPLOYMENTS_ENABLED: "true"
       SERVICES_CONFIG: /config/services.json
       WORKER_URL: http://worker:8877
       WORKER_TOKEN: ${WORKER_TOKEN:?Run node setup.js to generate WORKER_TOKEN}

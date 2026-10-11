@@ -1,3 +1,5 @@
+import { readServiceRegistry as loadServiceRegistry, monitoringRegistry } from './service-registry';
+import { processDeploymentCandidates, recordManualStaging } from './deployment-candidates';
 import { card, withCard, pingCard, helpCard, deploymentCard, ciStatusCard, latencyLabel, shorten } from './responses';
 import 'dotenv/config';
 import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
@@ -62,15 +64,7 @@ type EnvironmentName='staging'|'production';
 type ServiceSpec={github_repository:string;workflow_name:string;staging_branch:string;production_branch:string;image_repository:string;environments:Record<EnvironmentName,{compose_project:string;compose_file:string;compose_service:string;health_timeout_seconds?:number}>};
 type ServiceRegistry={services:Record<string,ServiceSpec>};
 const servicesConfigPath=process.env.SERVICES_CONFIG??'config/services.json';
-function readServiceRegistry():ServiceRegistry {
-  if(!existsSync(servicesConfigPath)) return {services:{}};
-  const source=readFileSync(servicesConfigPath,'utf8');
-  let data:ServiceRegistry;
-  try { data=JSON.parse(source) as ServiceRegistry; }
-  catch { throw new SetupGuidanceError('deploy', 'The local service registry could not be read as JSON.', ['valid services object'], 'config/services.json', ['Check the file syntax and keep each service definition under the top-level `services` key.']); }
-  if(!data.services||typeof data.services!=='object') throw new SetupGuidanceError('deploy', 'The local service registry is missing its services object.', ['services object'], 'config/services.json');
-  return data;
-}
+function readServiceRegistry(){return loadServiceRegistry(servicesConfigPath);}
 function registeredService(name:string){
   const registry=readServiceRegistry();
   if(!Object.hasOwn(registry.services,name)) throw new SetupGuidanceError('deploy', `Service “${name}” has not been registered by the host owner.`, ['service entry'], 'config/services.json', [
@@ -79,6 +73,7 @@ function registeredService(name:string){
   return registry.services[name];
 }
 async function workerCall(body:Record<string,unknown>){
+  if(process.env.DEPLOYMENTS_ENABLED==='false')throw new SetupGuidanceError('deploy','Application deployments are disabled.',['DEPLOYMENTS_ENABLED'],'.env',['Run node setup.js and select Application deployments to configure and launch the worker.']);
   const workerToken=process.env.WORKER_TOKEN;
   const url=process.env.WORKER_URL;
   if(!workerToken||workerToken.length<64||!url) throw new SetupGuidanceError('deploy', 'Deployment actions are disabled because the worker is not configured.', [...(!workerToken||workerToken.length<64?['WORKER_TOKEN']:[]), ...(!url?['WORKER_URL']:[]), 'DOCKER_SOCKET_PATH', 'DOCKER_SOCKET_GID'], '.env', [
@@ -125,6 +120,7 @@ async function verifyRelease(service:ServiceSpec,environment:EnvironmentName,sha
     const latest=(latestPayload.workflow_runs??[]).filter(run=>run.name===service.workflow_name&&run.event==='push'&&run.head_repository?.full_name.toLowerCase()===service.github_repository.toLowerCase()&&run.head_branch===branch&&run.status==='completed'&&run.conclusion==='success').sort((a,b)=>b.run_number-a.run_number)[0];
     if(!latest||latest.head_sha.toLowerCase()!==sha.toLowerCase()) throw new Error('A newer successful production release exists; request approval for the latest commit.');
   }
+  return validRuns.filter(run=>run.head_sha.toLowerCase()===sha.toLowerCase()).sort((a,b)=>b.run_number-a.run_number)[0].run_number;
 }
 function askConfig(){
   const provider=process.env.ASK_PROVIDER;
@@ -273,6 +269,7 @@ if (!token) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 let githubPollRunning = false;
 let githubErrorActive = false;
+let deploymentConfigErrorActive = false;
 type GitHubTriggerEvent={trigger:GitHubTriggerName;message:string};
 async function postChannel(channelId: string | undefined, content: string) {
   if (!channelId) return false;
@@ -313,54 +310,48 @@ async function pollGithub() {
   try {
     for(const repo of repos){
       if(!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) { log('ERROR',`Invalid configured GitHub repository: ${repo}`); continue; }
-      const response=await fetch(`https://api.github.com/repos/${repo}/actions/runs?per_page=10`,{
+      const response=await fetch(`https://api.github.com/repos/${repo}/actions/runs?per_page=100`,{
         headers:{Authorization:`Bearer ${process.env.GITHUB_TOKEN}`,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},
         signal:AbortSignal.timeout(10000)
       });
       if(!response.ok) throw new Error(`GitHub Actions request failed for ${repo} (HTTP ${response.status}).`);
-      const payload=await response.json() as {workflow_runs?:Array<{id:number;name:string;status:string;conclusion:string|null;head_branch:string;head_sha:string;html_url:string;updated_at:string;event:string;head_repository?:{full_name:string}|null}>};
+      const payload=await response.json() as {workflow_runs?:Array<{id:number;name:string;status:string;conclusion:string|null;head_branch:string;head_sha:string;html_url:string;updated_at:string;event:string;run_number:number;head_repository?:{full_name:string}|null}>};
+      const repositoryBaselineKey='github_workflow_baseline:'+repo.toLowerCase();
+      const repositoryBaseline=db.prepare('SELECT value FROM setting WHERE key=?').get(repositoryBaselineKey) as {value:string}|undefined;
+      const repositoryBaselineReady=repositoryBaseline?.value==='ready'||(!repositoryBaseline&&baseline?.value==='ready'&&Boolean(db.prepare('SELECT 1 FROM github_run WHERE repository=? LIMIT 1').get(repo)));
+      const successfulBefore=new Set<number>();
       for(const run of payload.workflow_runs??[]){
         const previous=db.prepare('SELECT status,conclusion FROM github_run WHERE repository=? AND run_id=?').get(repo,run.id) as {status:string;conclusion:string|null}|undefined;
+        if(previous?.status==='completed'&&previous.conclusion==='success')successfulBefore.add(run.id);
         db.prepare(`INSERT INTO github_run(repository,run_id,workflow,status,conclusion,branch,sha,url,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
           ON CONFLICT(repository,run_id) DO UPDATE SET workflow=excluded.workflow,status=excluded.status,conclusion=excluded.conclusion,branch=excluded.branch,sha=excluded.sha,url=excluded.url,updated_at=excluded.updated_at`)
           .run(repo,run.id,run.name,run.status,run.conclusion,run.head_branch,run.head_sha,run.html_url,run.updated_at);
-        const change=classifyGitHubRunChange(baseline?.value==='ready',previous,run);
+        const change=classifyGitHubRunChange(repositoryBaselineReady,previous,run);
         if(change){
           const routes=change.trigger?db.prepare('SELECT action FROM schedule WHERE trigger=?').all(change.trigger) as Array<{action:string}>:[];
           const hasTriggerRoute=hasConfiguredNotificationRoute(change.trigger,routes.map(route=>route.action),Boolean(process.env.GITHUB_CHANNEL_ID),Boolean(process.env.ERROR_CHANNEL_ID));
           if(change.trigger&&hasTriggerRoute)triggerEvents.push({trigger:change.trigger,message:change.message});
           else await postChannel(process.env.GITHUB_CHANNEL_ID,change.message);
         }
-        if(baseline?.value==='ready'&&run.event==='push'&&run.head_repository?.full_name.toLowerCase()===repo.toLowerCase()&&run.status==='completed'&&run.conclusion==='success'){
-          const registry=readServiceRegistry();
-          for(const [serviceName,service] of Object.entries(registry.services)){
-            if(service.github_repository===repo&&service.workflow_name===run.name&&service.production_branch===run.head_branch){
-              db.prepare("UPDATE pending_deployment SET status='superseded' WHERE service=? AND environment='production' AND operation='release' AND status='pending' AND sha<>?").run(serviceName,run.head_sha);
-            }
-            if(service.github_repository!==repo||service.workflow_name!==run.name||service.staging_branch!==run.head_branch) continue;
-            const prior=db.prepare('SELECT status,attempts FROM staging_deployment WHERE service=? AND sha=?').get(serviceName,run.head_sha) as {status:string;attempts:number}|undefined;
-            if(prior?.status==='healthy'||(prior&&prior.attempts>=3)) continue;
-            if(prior?.status==='deploying'){
-              try{
-                const current=await workerCall({operation:'status',service:serviceName,environment:'staging'});
-                if(current.active_sha===run.head_sha){db.prepare("UPDATE staging_deployment SET status='healthy',detail='recovered from worker state',updated_at=? WHERE service=? AND sha=?").run(new Date().toISOString(),serviceName,run.head_sha);continue;}
-              }catch{}
-            }
-            if(prior) db.prepare("UPDATE staging_deployment SET status='deploying',attempts=attempts+1,updated_at=? WHERE service=? AND sha=?").run(new Date().toISOString(),serviceName,run.head_sha);
-            else db.prepare("INSERT INTO staging_deployment(service,sha,status,detail,attempts) VALUES(?,?,'deploying','automatic successful CI deployment',1)").run(serviceName,run.head_sha);
-            try{
-              const result=await workerCall({operation:'deploy',service:serviceName,environment:'staging',sha:run.head_sha});
-              db.prepare("UPDATE staging_deployment SET status='healthy',detail=?,updated_at=? WHERE service=? AND sha=?").run(String(result.digest??'healthy'),new Date().toISOString(),serviceName,run.head_sha);
-              await postChannel(process.env.GITHUB_CHANNEL_ID,`Staging deployed · **${serviceName}** · ${run.head_sha.slice(0,7)} · healthy.`);
-            }catch(error){
-              const detail=error instanceof Error?error.message:'deployment failed';
-              db.prepare("UPDATE staging_deployment SET status='failed',detail=?,updated_at=? WHERE service=? AND sha=?").run(detail.slice(0,500),new Date().toISOString(),serviceName,run.head_sha);
-              log('ERROR',`Automatic staging deployment ${serviceName} failed: ${detail}`);
-              await postChannel(process.env.ERROR_CHANNEL_ID,`Automatic staging deployment failed for ${serviceName} (${run.head_sha.slice(0,7)}). Check SANWAN logs.`);
-            }
-          }
-        }
       }
+      let registryFailed=false;
+      const registry=monitoringRegistry(servicesConfigPath,error=>{
+        registryFailed=true;
+        log('ERROR','Deployment registry unavailable: '+(error instanceof Error?error.message:'invalid configuration'));
+      });
+      if(registryFailed){
+        if(!deploymentConfigErrorActive)await postChannel(process.env.ERROR_CHANNEL_ID,'Application deployments are unavailable: check config/services.json permissions and syntax using node setup.js. GitHub monitoring continues.');
+        deploymentConfigErrorActive=true;
+      }else deploymentConfigErrorActive=false;
+      const services=Object.fromEntries(Object.entries(registry.services).filter(([,service])=>service.github_repository.toLowerCase()===repo.toLowerCase()));
+      await processDeploymentCandidates(db,services,payload.workflow_runs??[],repositoryBaselineReady,successfulBefore,process.env.DEPLOYMENTS_ENABLED!=='false',workerCall,async(service,sha)=>{await verifyRelease(service as ServiceSpec,'production',sha);},async notice=>{
+        if(notice.kind==='healthy')await postChannel(process.env.GITHUB_CHANNEL_ID,`Staging deployed · **${notice.service}** · ${notice.sha.slice(0,7)} · healthy.`);
+        else{
+          log('ERROR',`Automatic staging deployment ${notice.service} failed: ${notice.detail}`);
+          await postChannel(process.env.ERROR_CHANNEL_ID,`Automatic staging deployment failed for ${notice.service} (${notice.sha.slice(0,7)}). Check SANWAN logs.`);
+        }
+      });
+      db.prepare("INSERT INTO setting(key,value) VALUES(?,'ready') ON CONFLICT(key) DO UPDATE SET value='ready'").run(repositoryBaselineKey);
       succeeded++;
     }
     if(succeeded===repos.length){
@@ -561,9 +552,11 @@ client.on('interactionCreate', async interaction => {
       }else if(action==='release'){
         const sha=interaction.options.getString('commit',true).toLowerCase();
         await interaction.deferReply({ephemeral:true});
-        await verifyRelease(service,environment,sha);
+        const verifiedRunNumber=await verifyRelease(service,environment,sha);
         if(environment==='staging'){
+          if(!Number.isSafeInteger(verifiedRunNumber)||verifiedRunNumber<1)throw new Error('Verified workflow run number is unavailable.');
           const result=await workerCall({operation:'deploy',service:serviceName,environment,sha});
+          recordManualStaging(db,serviceName,service,sha,verifiedRunNumber);
           db.prepare("INSERT INTO staging_deployment(service,sha,status,detail,attempts) VALUES(?,?,'healthy','manual successful deployment',1) ON CONFLICT(service,sha) DO UPDATE SET status='healthy',detail='manual successful deployment',updated_at=CURRENT_TIMESTAMP").run(serviceName,sha);
           await interaction.editReply(deploymentCard('release', serviceName, environment, { ...result, active_sha: sha }));
         }else{

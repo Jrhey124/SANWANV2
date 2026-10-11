@@ -77,3 +77,7 @@ The included `.github/workflows/container.yml` tests SANWAN and builds both Dock
 The bot container targets Linux x64 and ARM64. Windows hosts can run it through Docker Desktop's Linux-container backend. The bot works with Docker Desktop's standard engine; the optional deployment worker requires a rootless Linux Docker Engine and refuses a rootful daemon ([Docker rootless mode](https://docs.docker.com/engine/security/rootless/)). GitHub events are detected by outbound polling, so no public webhook endpoint is required; direct webhook delivery, cron expressions, arbitrary shell commands, and remote multi-host workers are not implemented. `/ask` sends only the question text to its configured provider; it does not receive automatic access to notes, logs, or secrets.
 
 `node uninstall.js` asks for `STOP` before removing containers. It preserves volumes and `.env` by default; entering `PURGE` also erases the encrypted database, logs, worker state, and `.env`. Locally registered service definitions are preserved.
+
+## License
+
+SANWAN is licensed under the [MIT License](LICENSE).
